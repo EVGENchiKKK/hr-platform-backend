@@ -1,9 +1,6 @@
 const { verifyToken, extractToken } = require('../utils/jwt');
 const { pool } = require('../config/database');
 
-/**
- * Middleware для проверки аутентификации
- */
 const authenticate = async (req, res, next) => {
   try {
     const token = extractToken(req.headers.authorization);
@@ -24,7 +21,6 @@ const authenticate = async (req, res, next) => {
       });
     }
 
-    // Проверка существования пользователя в БД
     const [users] = await pool.query(
       'SELECT User_ID, U_is_active, Role_ID FROM user WHERE User_ID = ?',
       [decoded.userId]
@@ -44,7 +40,6 @@ const authenticate = async (req, res, next) => {
       });
     }
 
-    // Добавляем пользователя в запрос
     req.user = {
       userId: users[0].User_ID,
       roleId: users[0].Role_ID,
@@ -61,9 +56,6 @@ const authenticate = async (req, res, next) => {
   }
 };
 
-/**
- * Middleware для проверки роли
- */
 const requireRole = (...allowedRoles) => {
   return (req, res, next) => {
     if (!req.user || !allowedRoles.includes(req.user.roleName)) {

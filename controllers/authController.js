@@ -2,14 +2,10 @@ const { pool } = require('../config/database');
 const { hashPassword, comparePassword, validatePasswordStrength } = require('../utils/password');
 const { generateToken } = require('../utils/jwt');
 
-/**
- * Регистрация нового пользователя
- */
 exports.register = async (req, res) => {
   const { firstName, lastName, email, password } = req.body;
 
   try {
-    // Проверка сложности пароля
     const passwordValidation = validatePasswordStrength(password);
     if (!passwordValidation.isValid) {
       return res.status(400).json({
@@ -19,7 +15,6 @@ exports.register = async (req, res) => {
       });
     }
 
-    // Проверка существования email
     const [existingUsers] = await pool.query(
       'SELECT User_ID FROM user WHERE U_email = ?',
       [email]
@@ -32,13 +27,10 @@ exports.register = async (req, res) => {
       });
     }
 
-    // Хэширование пароля
     const passwordHash = await hashPassword(password);
 
-    // Определение роли по умолчанию (employee = 4)
     const defaultRoleId = 4;
     
-    // Определение отдела по умолчанию (берём первый активный)
     const [departments] = await pool.query(
       'SELECT Department_ID FROM department WHERE D_is_active = TRUE LIMIT 1'
     );
@@ -52,19 +44,18 @@ exports.register = async (req, res) => {
 
     const defaultDepartmentId = departments[0].Department_ID;
 
-    // Создание пользователя
     const [result] = await pool.query(
       `INSERT INTO user (
         U_login, U_password_hash, U_name, U_surname, U_email, 
         U_hire_date, Role_ID, Department_ID, U_is_active
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        email.split('@')[0], // login из email
+        email.split('@')[0],
         passwordHash,
         firstName.trim(),
         lastName.trim(),
         email.toLowerCase(),
-        new Date(), // дата приёма
+        new Date(),
         defaultRoleId,
         defaultDepartmentId,
         true
@@ -73,7 +64,6 @@ exports.register = async (req, res) => {
 
     const userId = result.insertId;
 
-    // Генерация токена
     const token = generateToken({
       userId,
       email,
@@ -104,14 +94,10 @@ exports.register = async (req, res) => {
   }
 };
 
-/**
- * Авторизация пользователя
- */
 exports.login = async (req, res) => {
   const { email, password, remember } = req.body;
 
   try {
-    // Поиск пользователя по email
     const [users] = await pool.query(
       `SELECT 
         u.User_ID, u.U_login, u.U_password_hash, u.U_name, u.U_surname, 
@@ -135,7 +121,6 @@ exports.login = async (req, res) => {
 
     const user = users[0];
 
-    // Проверка активности аккаунта
     if (!user.U_is_active) {
       return res.status(403).json({
         success: false,
@@ -143,7 +128,6 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Проверка пароля
     const isPasswordValid = await comparePassword(password, user.U_password_hash);
     
     if (!isPasswordValid) {
@@ -153,13 +137,11 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Обновление last_login
     await pool.query(
       'UPDATE user SET U_last_login = NOW() WHERE User_ID = ?',
       [user.User_ID]
     );
 
-    // Генерация токена
     const expiresIn = remember ? '30d' : '7d';
     const token = generateToken({
       userId: user.User_ID,
@@ -167,7 +149,6 @@ exports.login = async (req, res) => {
       role: user.role_name
     });
 
-    // Подготовка ответа (без чувствительных данных)
     const userData = {
       id: user.User_ID,
       login: user.U_login,
@@ -200,9 +181,6 @@ exports.login = async (req, res) => {
   }
 };
 
-/**
- * Получение данных текущего пользователя
- */
 exports.getMe = async (req, res) => {
   try {
     const [users] = await pool.query(
@@ -253,9 +231,6 @@ exports.getMe = async (req, res) => {
   }
 };
 
-/**
- * Выход из системы (инвалидация токена на клиенте)
- */
 exports.logout = (req, res) => {
   res.json({
     success: true,

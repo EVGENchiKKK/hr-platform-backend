@@ -1,6 +1,5 @@
 const { body, validationResult } = require('express-validator');
 
-// Валидация для регистрации
 const registerValidation = [
   body('firstName')
     .trim()
@@ -36,7 +35,6 @@ const registerValidation = [
     .equals('true').withMessage('Необходимо согласиться с условиями использования')
 ];
 
-// Валидация для входа
 const loginValidation = [
   body('email')
     .trim()
@@ -48,7 +46,6 @@ const loginValidation = [
     .notEmpty().withMessage('Пароль обязателен')
 ];
 
-// Обработка ошибок валидации
 const handleValidationErrors = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
