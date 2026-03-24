@@ -9,6 +9,8 @@ const authController = require('../controllers/authController');
 
 const router = express.Router();
 
+router.get('/register-meta', authController.getRegisterMeta);
+
 router.post(
   '/register',
   registerValidation,

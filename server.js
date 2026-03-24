@@ -6,6 +6,7 @@ require('dotenv').config();
 
 const { testConnection } = require('./config/database');
 const authRoutes = require('./routes/authRoute');
+const workspaceRoutes = require('./routes/workspaceRoute');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -26,7 +27,7 @@ app.use(cors({
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 200,
   message: {
     success: false,
     error: 'Слишком много попыток, попробуйте позже'
@@ -49,6 +50,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api/workspace', workspaceRoutes);
 
 app.use((req, res) => {
   res.status(404).json({
