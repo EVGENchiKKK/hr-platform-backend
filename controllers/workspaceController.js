@@ -91,6 +91,120 @@ const getLastMonths = (count = 6) => {
   return months;
 };
 
+const countCourseModules = (contentStructure) => {
+  if (!Array.isArray(contentStructure)) {
+    return 0;
+  }
+
+  return contentStructure.length;
+};
+
+const countCourseLessons = (contentStructure) => {
+  if (!Array.isArray(contentStructure)) {
+    return 0;
+  }
+
+  return contentStructure.reduce((total, module) => {
+    const lessons = Array.isArray(module?.lessons) ? module.lessons.length : 0;
+    return total + lessons;
+  }, 0);
+};
+
+const normalizeSurveyAnswers = (questions, answers) => {
+  const answerMap = new Map();
+
+  if (Array.isArray(answers)) {
+    answers.forEach((answer) => {
+      answerMap.set(String(answer.question_id), answer.answer);
+    });
+  } else if (answers && typeof answers === 'object') {
+    Object.entries(answers).forEach(([key, value]) => {
+      answerMap.set(String(key), value);
+    });
+  }
+
+  return questions.map((question) => ({
+    question_id: question.id,
+    answer: answerMap.get(String(question.id)) ?? null
+  }));
+};
+
+const isEmptyAnswer = (answer) => {
+  if (answer === null || answer === undefined) {
+    return true;
+  }
+
+  if (typeof answer === 'string') {
+    return answer.trim() === '';
+  }
+
+  return false;
+};
+
+const calculateSurveyScore = (surveyType, questions, normalizedAnswers) => {
+  if (!questions.length) {
+    return 0;
+  }
+
+  if (surveyType === 'test') {
+    const totalPoints = questions.reduce((sum, question) => sum + Number(question.points || 1), 0) || 1;
+    const earnedPoints = questions.reduce((sum, question) => {
+      const answer = normalizedAnswers.find((item) => Number(item.question_id) === Number(question.id));
+      if (!answer || isEmptyAnswer(answer.answer)) {
+        return sum;
+      }
+
+      return String(answer.answer) === String(question.correct) ? sum + Number(question.points || 1) : sum;
+    }, 0);
+
+    return Math.round((earnedPoints / totalPoints) * 100);
+  }
+
+  const answeredCount = normalizedAnswers.filter((answer) => !isEmptyAnswer(answer.answer)).length;
+  return Math.round((answeredCount / questions.length) * 100);
+};
+
+const mapEnrollment = (row, totalLessons) => {
+  if (!row?.my_enrollment_id) {
+    return null;
+  }
+
+  const totalModules = Number(row.my_total_lessons || totalLessons || 0);
+  const completedModules = Number(row.my_completed_lessons || 0);
+
+  return {
+    id: row.my_enrollment_id,
+    currentLessonIndex: Number(row.my_current_lesson_index || 0),
+    currentModuleIndex: Number(row.my_current_lesson_index || 0),
+    progressPercent: Number(row.my_progress_percent || 0),
+    completedLessons: completedModules,
+    completedModules,
+    totalLessons,
+    totalModules,
+    finalScore: row.my_final_score === null ? null : Number(row.my_final_score),
+    isCompleted: Boolean(row.my_is_completed),
+    isCertified: Boolean(row.my_is_certified),
+    enrolledAt: row.my_enrolled_at,
+    lastAccessed: row.my_last_accessed,
+    completedAt: row.my_completed_at
+  };
+};
+
+const mapSurveyResult = (row) => {
+  if (!row?.my_result_id) {
+    return null;
+  }
+
+  return {
+    id: row.my_result_id,
+    answers: safeJsonParse(row.my_answers, []),
+    score: Number(row.my_score || 0),
+    isCompleted: Boolean(row.my_is_completed),
+    startedAt: row.my_started_at,
+    submittedAt: row.my_submitted_at
+  };
+};
+
 const ensureAppealMessagesTable = async () => {
   if (!ensureAppealMessagesTablePromise) {
     ensureAppealMessagesTablePromise = pool.query(
@@ -203,6 +317,19 @@ const fetchInsertedMessage = async (executor, messageId) => {
 exports.getBootstrap = async (req, res) => {
   try {
     await ensureAppealMessagesTable();
+    const [currentUserRows] = await pool.query(
+      `SELECT r.R_name, u.Department_ID, d.D_name AS department_name
+       FROM user u
+       JOIN role r ON r.Role_ID = u.Role_ID
+       LEFT JOIN department d ON d.Department_ID = u.Department_ID
+       WHERE u.User_ID = ?
+       LIMIT 1`,
+      [req.user.userId]
+    );
+    const currentRoleName = normalizeRoleName(currentUserRows[0]?.R_name);
+    const currentDepartmentId = Number(currentUserRows[0]?.Department_ID || 0) || null;
+    const currentDepartmentName = currentUserRows[0]?.department_name || null;
+    const canViewPeopleInsights = isAppealManager(currentRoleName);
 
     const [employeeRows, departmentRows, taskRows, appealRows, forumRows, courseRows, surveyRows] = await Promise.all([
       pool.query(
@@ -216,15 +343,23 @@ exports.getBootstrap = async (req, res) => {
           COALESCE(tk.completion_rate, 0) AS completion_rate,
           COALESCE(course_stats.avg_progress, 0) AS course_progress,
           COALESCE(course_stats.completed_courses, 0) AS completed_courses,
+          COALESCE(course_stats.completed_modules, 0) AS completed_modules,
+          COALESCE(course_stats.total_modules, 0) AS total_modules,
           COALESCE(appeal_stats.appeal_count, 0) AS appeal_count,
           COALESCE(forum_stats.topic_count, 0) AS forum_topic_count,
-          COALESCE(survey_stats.survey_count, 0) AS survey_count
+          COALESCE(survey_stats.survey_count, 0) AS survey_count,
+          COALESCE(survey_stats.avg_survey_score, 0) AS avg_survey_score
         FROM user u
         LEFT JOIN role r ON r.Role_ID = u.Role_ID
         LEFT JOIN department d ON d.Department_ID = u.Department_ID
         LEFT JOIN v_task_kpi tk ON tk.User_ID = u.User_ID
         LEFT JOIN (
-          SELECT User_ID, AVG(E_progress_percent) AS avg_progress, SUM(CASE WHEN E_is_completed = 1 THEN 1 ELSE 0 END) AS completed_courses
+          SELECT
+            User_ID,
+            AVG(E_progress_percent) AS avg_progress,
+            SUM(CASE WHEN E_is_completed = 1 THEN 1 ELSE 0 END) AS completed_courses,
+            SUM(COALESCE(E_completed_lessons, 0)) AS completed_modules,
+            SUM(COALESCE(E_total_lessons, 0)) AS total_modules
           FROM enrollment
           GROUP BY User_ID
         ) course_stats ON course_stats.User_ID = u.User_ID
@@ -239,8 +374,12 @@ exports.getBootstrap = async (req, res) => {
           GROUP BY Author_ID
         ) forum_stats ON forum_stats.Author_ID = u.User_ID
         LEFT JOIN (
-          SELECT User_ID, COUNT(*) AS survey_count
+          SELECT
+            User_ID,
+            COUNT(*) AS survey_count,
+            AVG(SR_score) AS avg_survey_score
           FROM opros_result
+          WHERE OR_is_completed = 1
           GROUP BY User_ID
         ) survey_stats ON survey_stats.User_ID = u.User_ID
         WHERE u.U_is_active = TRUE
@@ -264,6 +403,7 @@ exports.getBootstrap = async (req, res) => {
       pool.query(
         `SELECT
           t.Task_ID, t.T_title, t.T_description, t.T_priority, t.T_status, t.T_deadline, t.T_created,
+          t.T_assignee_user_id, t.T_assignee_dept_id,
           d.D_name AS department_name,
           CONCAT(au.U_name, ' ', au.U_surname) AS assignee_name,
           t.T_kpi_metrics
@@ -276,6 +416,7 @@ exports.getBootstrap = async (req, res) => {
         `SELECT
           a.Appeal_ID, a.User_ID AS author_id, a.A_type, a.A_category, a.A_priority, a.A_content,
           a.A_status, a.A_response, a.A_created, a.A_updated, a.A_closed_at, a.A_responder_id,
+          a.A_is_anonymous, a.A_is_confidential,
           CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
           author_role.R_name AS author_role_name,
           d.D_name AS department_name,
@@ -291,7 +432,7 @@ exports.getBootstrap = async (req, res) => {
       ),
       pool.query(
         `SELECT
-          vfa.Forum_them_ID, vfa.FT_name, vfa.author_name, vfa.department, vfa.FT_views_count, vfa.FT_posts_count,
+          vfa.Forum_them_ID, ft.Author_ID, vfa.FT_name, vfa.author_name, vfa.department, vfa.FT_views_count, vfa.FT_posts_count,
           vfa.FT_created, vfa.FT_is_locked, ft.FT_category
         FROM v_forum_activity vfa
         JOIN forum_them ft ON ft.Forum_them_ID = vfa.Forum_them_ID
@@ -299,23 +440,27 @@ exports.getBootstrap = async (req, res) => {
       ),
       pool.query(
         `SELECT
-          c.Course_ID, c.C_name, c.C_description, c.C_category, c.C_estimated_hours, c.C_content_structure,
+          c.Course_ID, c.C_name, c.C_description, c.C_category, c.C_estimated_hours, c.C_content_structure, c.C_content_url,
+          c.C_department_id, department.D_name AS course_department_name,
           c.C_is_published, c.C_created, creator.U_name AS creator_name, creator.U_surname AS creator_surname,
           COUNT(DISTINCT e.Enrollment_ID) AS enrolled_count,
           SUM(CASE WHEN e.E_is_completed = 1 THEN 1 ELSE 0 END) AS completed_count
         FROM course c
         JOIN user creator ON creator.User_ID = c.C_created_by
+        LEFT JOIN department department ON department.Department_ID = c.C_department_id
         LEFT JOIN enrollment e ON e.Course_ID = c.Course_ID
         GROUP BY c.Course_ID
         ORDER BY c.C_created DESC`
       ),
       pool.query(
         `SELECT
-          o.Opros_ID, o.O_title, o.O_description, o.O_type, o.O_is_active, o.O_start_date, o.O_end_date,
+          o.Opros_ID, o.O_title, o.O_description, o.O_type, o.O_questions, o.O_is_active, o.O_start_date, o.O_end_date,
+          o.O_department_id, department.D_name AS survey_department_name,
           creator.U_name AS creator_name, creator.U_surname AS creator_surname,
           COUNT(DISTINCT r.Opros_Result_ID) AS response_count
         FROM opros o
         JOIN user creator ON creator.User_ID = o.O_created_by
+        LEFT JOIN department department ON department.Department_ID = o.O_department_id
         LEFT JOIN opros_result r ON r.Opros_ID = o.Opros_ID
         GROUP BY o.Opros_ID
         ORDER BY o.O_created DESC`
@@ -323,6 +468,9 @@ exports.getBootstrap = async (req, res) => {
     ]);
 
     const appealIds = appealRows[0].map((row) => row.Appeal_ID);
+    const courseIds = courseRows[0].map((row) => row.Course_ID);
+    const surveyIds = surveyRows[0].map((row) => row.Opros_ID);
+    const forumTopicIds = forumRows[0].map((row) => row.Forum_them_ID);
     const [appealMessageRows] = appealIds.length > 0
       ? await pool.query(
         `SELECT
@@ -338,6 +486,113 @@ exports.getBootstrap = async (req, res) => {
       )
       : [[]];
 
+    const [forumPostRows] = forumTopicIds.length > 0
+      ? await pool.query(
+        `SELECT
+          fp.Forum_posts_ID, fp.Forum_them_ID, fp.Author_ID, fp.FP_content, fp.FP_created, fp.FP_updated, fp.FP_is_edited, fp.FP_is_solution,
+          CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+          r.R_name AS role_name,
+          d.D_name AS department_name
+        FROM forum_posts fp
+        JOIN user u ON u.User_ID = fp.Author_ID
+        LEFT JOIN role r ON r.Role_ID = u.Role_ID
+        LEFT JOIN department d ON d.Department_ID = u.Department_ID
+        WHERE fp.Forum_them_ID IN (?)
+        ORDER BY fp.FP_created ASC, fp.Forum_posts_ID ASC`,
+        [forumTopicIds]
+      )
+      : [[]];
+
+    const [userEnrollmentRows] = courseIds.length > 0
+      ? await pool.query(
+        `SELECT
+          Enrollment_ID AS my_enrollment_id,
+          Course_ID,
+          E_current_lesson_index AS my_current_lesson_index,
+          E_progress_percent AS my_progress_percent,
+          E_completed_lessons AS my_completed_lessons,
+          E_total_lessons AS my_total_lessons,
+          E_final_score AS my_final_score,
+          E_is_completed AS my_is_completed,
+          E_is_certified AS my_is_certified,
+          E_enrolled_at AS my_enrolled_at,
+          E_last_accessed AS my_last_accessed,
+          E_completed_at AS my_completed_at
+        FROM enrollment
+        WHERE User_ID = ? AND Course_ID IN (?)`,
+        [req.user.userId, courseIds]
+      )
+      : [[]];
+
+    const [userSurveyResultRows] = surveyIds.length > 0
+      ? await pool.query(
+        `SELECT
+          Opros_Result_ID AS my_result_id,
+          Opros_ID,
+          OR_answers AS my_answers,
+          SR_score AS my_score,
+          OR_is_completed AS my_is_completed,
+          OR_started_at AS my_started_at,
+          OR_submitted_at AS my_submitted_at
+        FROM opros_result
+        WHERE User_ID = ? AND Opros_ID IN (?)`,
+        [req.user.userId, surveyIds]
+      )
+      : [[]];
+
+    const [allEnrollmentRows] = canViewPeopleInsights && courseIds.length > 0
+      ? await pool.query(
+        `SELECT
+          e.User_ID,
+          e.Course_ID,
+          e.Enrollment_ID,
+          e.E_current_lesson_index,
+          e.E_progress_percent,
+          e.E_completed_lessons,
+          e.E_total_lessons,
+          e.E_final_score,
+          e.E_is_completed,
+          e.E_is_certified,
+          e.E_enrolled_at,
+          e.E_last_accessed,
+          e.E_completed_at,
+          CONCAT(u.U_surname, ' ', u.U_name, IF(u.U_lastname IS NOT NULL AND u.U_lastname <> '', CONCAT(' ', u.U_lastname), '')) AS employee_name,
+          d.D_name AS department_name,
+          r.R_name AS role_name
+        FROM enrollment e
+        JOIN user u ON u.User_ID = e.User_ID
+        LEFT JOIN department d ON d.Department_ID = u.Department_ID
+        LEFT JOIN role r ON r.Role_ID = u.Role_ID
+        WHERE e.Course_ID IN (?)
+        ORDER BY employee_name ASC`,
+        [courseIds]
+      )
+      : [[]];
+
+    const [allSurveyResultRows] = canViewPeopleInsights && surveyIds.length > 0
+      ? await pool.query(
+        `SELECT
+          sr.User_ID,
+          sr.Opros_ID,
+          sr.Opros_Result_ID,
+          sr.OR_answers,
+          sr.SR_score,
+          sr.OR_is_completed,
+          sr.OR_started_at,
+          sr.OR_submitted_at,
+          CONCAT(u.U_surname, ' ', u.U_name, IF(u.U_lastname IS NOT NULL AND u.U_lastname <> '', CONCAT(' ', u.U_lastname), '')) AS employee_name,
+          d.D_name AS department_name,
+          r.R_name AS role_name
+        FROM opros_result sr
+        JOIN user u ON u.User_ID = sr.User_ID
+        LEFT JOIN department d ON d.Department_ID = u.Department_ID
+        LEFT JOIN role r ON r.Role_ID = u.Role_ID
+        WHERE sr.Opros_ID IN (?)
+        ORDER BY employee_name ASC`,
+        [surveyIds]
+      )
+      : [[]];
+
     const messagesByAppeal = appealMessageRows.reduce((accumulator, row) => {
       const currentMessages = accumulator.get(row.Appeal_ID) || [];
       currentMessages.push(buildPersistedMessage(row));
@@ -345,9 +600,130 @@ exports.getBootstrap = async (req, res) => {
       return accumulator;
     }, new Map());
 
+    const enrollmentsByCourse = userEnrollmentRows.reduce((accumulator, row) => {
+      accumulator.set(row.Course_ID, row);
+      return accumulator;
+    }, new Map());
+
+    const resultsBySurvey = userSurveyResultRows.reduce((accumulator, row) => {
+      accumulator.set(row.Opros_ID, row);
+      return accumulator;
+    }, new Map());
+
+    const enrollmentsByCourseAll = allEnrollmentRows.reduce((accumulator, row) => {
+      const currentRows = accumulator.get(row.Course_ID) || [];
+      currentRows.push({
+        employeeId: row.User_ID,
+        employeeName: row.employee_name,
+        department: row.department_name,
+        role: row.role_name,
+        enrollmentId: row.Enrollment_ID,
+        currentLessonIndex: Number(row.E_current_lesson_index || 0),
+        currentModuleIndex: Number(row.E_current_lesson_index || 0),
+        progressPercent: Number(row.E_progress_percent || 0),
+        completedLessons: Number(row.E_completed_lessons || 0),
+        completedModules: Number(row.E_completed_lessons || 0),
+        totalLessons: Number(row.E_total_lessons || 0),
+        totalModules: Number(row.E_total_lessons || 0),
+        finalScore: row.E_final_score === null ? null : Number(row.E_final_score),
+        isCompleted: Boolean(row.E_is_completed),
+        isCertified: Boolean(row.E_is_certified),
+        enrolledAt: row.E_enrolled_at,
+        lastAccessed: row.E_last_accessed,
+        completedAt: row.E_completed_at
+      });
+      accumulator.set(row.Course_ID, currentRows);
+      return accumulator;
+    }, new Map());
+
+    const resultsBySurveyAll = allSurveyResultRows.reduce((accumulator, row) => {
+      const currentRows = accumulator.get(row.Opros_ID) || [];
+      currentRows.push({
+        employeeId: row.User_ID,
+        employeeName: row.employee_name,
+        department: row.department_name,
+        role: row.role_name,
+        resultId: row.Opros_Result_ID,
+        answers: safeJsonParse(row.OR_answers, []),
+        score: Number(row.SR_score || 0),
+        isCompleted: Boolean(row.OR_is_completed),
+        startedAt: row.OR_started_at,
+        submittedAt: row.OR_submitted_at
+      });
+      accumulator.set(row.Opros_ID, currentRows);
+      return accumulator;
+    }, new Map());
+
+    const forumPostsByTopic = forumPostRows.reduce((accumulator, row) => {
+      const currentRows = accumulator.get(row.Forum_them_ID) || [];
+      currentRows.push({
+        id: row.Forum_posts_ID,
+        topicId: row.Forum_them_ID,
+        authorId: row.Author_ID,
+        authorName: row.author_name,
+        authorRole: normalizeRoleName(row.role_name) || 'employee',
+        department: row.department_name || 'Без отдела',
+        content: row.FP_content,
+        createdAt: row.FP_created,
+        updatedAt: row.FP_updated,
+        isEdited: Boolean(row.FP_is_edited),
+        isSolution: Boolean(row.FP_is_solution)
+      });
+      accumulator.set(row.Forum_them_ID, currentRows);
+      return accumulator;
+    }, new Map());
+
+    const employeeCourseMap = allEnrollmentRows.reduce((accumulator, row) => {
+      const currentRows = accumulator.get(row.User_ID) || [];
+      currentRows.push({
+        courseId: row.Course_ID,
+        enrollmentId: row.Enrollment_ID,
+        progressPercent: Number(row.E_progress_percent || 0),
+        completedLessons: Number(row.E_completed_lessons || 0),
+        totalLessons: Number(row.E_total_lessons || 0),
+        finalScore: row.E_final_score === null ? null : Number(row.E_final_score),
+        isCompleted: Boolean(row.E_is_completed),
+        enrolledAt: row.E_enrolled_at,
+        completedAt: row.E_completed_at
+      });
+      accumulator.set(row.User_ID, currentRows);
+      return accumulator;
+    }, new Map());
+
+    const employeeSurveyMap = allSurveyResultRows.reduce((accumulator, row) => {
+      const currentRows = accumulator.get(row.User_ID) || [];
+      currentRows.push({
+        surveyId: row.Opros_ID,
+        resultId: row.Opros_Result_ID,
+        score: Number(row.SR_score || 0),
+        isCompleted: Boolean(row.OR_is_completed),
+        startedAt: row.OR_started_at,
+        submittedAt: row.OR_submitted_at
+      });
+      accumulator.set(row.User_ID, currentRows);
+      return accumulator;
+    }, new Map());
+
     const employees = employeeRows[0].map((row) => {
       const fullName = formatPersonName(row.U_name, row.U_surname, row.U_lastname);
-      const kpiBase = row.completion_rate || row.course_progress || Math.min(100, row.U_points_balance);
+      const employeeCourses = employeeCourseMap.get(row.User_ID) || [];
+      const employeeSurveys = employeeSurveyMap.get(row.User_ID) || [];
+      const moduleProgress = Number(row.total_modules || 0) > 0
+        ? Math.round((Number(row.completed_modules || 0) / Number(row.total_modules || 0)) * 100)
+        : Math.round(Number(row.course_progress || 0));
+      const surveyActivity = Math.min(Number(row.survey_count || 0) * 12, 24);
+      const moduleActivity = Math.min(Number(row.completed_modules || 0) * 6, 24);
+      const taskActivity = Math.round(Number(row.completion_rate || 0) * 0.4);
+      const pointsActivity = Math.min(Math.round(Number(row.U_points_balance || 0) / 10), 12);
+      const kpiBase = Math.min(
+        100,
+        taskActivity
+          + Math.round(moduleProgress * 0.3)
+          + surveyActivity
+          + moduleActivity
+          + pointsActivity
+      );
+
       return {
         id: row.User_ID,
         login: row.U_login,
@@ -369,11 +745,18 @@ exports.getBootstrap = async (req, res) => {
         completedTasks: Number(row.completed_tasks || 0),
         taskCompletion: Number(row.completion_rate || 0),
         courseProgress: Math.round(Number(row.course_progress || 0)),
+        moduleProgress,
         completedCourses: Number(row.completed_courses || 0),
+        completedModules: Number(row.completed_modules || 0),
+        totalModules: Number(row.total_modules || 0),
         appealCount: Number(row.appeal_count || 0),
         forumTopics: Number(row.forum_topic_count || 0),
         surveyCount: Number(row.survey_count || 0),
-        pointsBalance: Number(row.U_points_balance || 0)
+        averageSurveyScore: Math.round(Number(row.avg_survey_score || 0)),
+        pointsBalance: Number(row.U_points_balance || 0),
+        activityScore: Math.round(moduleActivity + surveyActivity + taskActivity + pointsActivity),
+        trainingRecords: employeeCourses,
+        surveyRecords: employeeSurveys
       };
     });
 
@@ -402,10 +785,13 @@ exports.getBootstrap = async (req, res) => {
       const metrics = safeJsonParse(row.T_kpi_metrics, []);
       return {
         id: row.Task_ID,
+        assigneeId: row.T_assignee_user_id ? Number(row.T_assignee_user_id) : null,
+        departmentId: row.T_assignee_dept_id ? Number(row.T_assignee_dept_id) : null,
         title: row.T_title,
         description: row.T_description,
         assignee: row.assignee_name || 'Не назначен',
         department: row.department_name || 'Без отдела',
+        createdAt: row.T_created,
         deadline: row.T_deadline,
         status: mapTaskStatus(row.T_status),
         kpiWeight: Math.round(Number(metrics?.[0]?.weight || 0) * 100) || 0,
@@ -420,61 +806,125 @@ exports.getBootstrap = async (req, res) => {
       return {
         id: row.Appeal_ID,
         authorId: row.author_id,
+        recipientId: row.A_responder_id ? Number(row.A_responder_id) : null,
+        recipientName: row.responder_name || 'Не назначен',
         subject: buildAppealSubject(row),
         from: row.author_name,
         department: row.department_name || 'Без отдела',
         date: row.A_created,
         status: mapAppealStatus(row.A_status),
         priority: row.A_priority || 'medium',
+        type: row.A_type || 'question',
         category: row.A_category || row.A_type,
         description: row.A_content,
         response: row.A_response,
+        isAnonymous: Boolean(row.A_is_anonymous),
+        isConfidential: Boolean(row.A_is_confidential),
         messages,
         lastMessageAt: messages[messages.length - 1]?.createdAt || row.A_created
       };
     });
 
-    const forumPosts = forumRows[0].map((row) => ({
-      id: row.Forum_them_ID,
-      title: row.FT_name,
-      author: row.author_name,
-      category: row.FT_category || 'Обсуждение',
-      replies: Number(row.FT_posts_count || 0),
-      views: Number(row.FT_views_count || 0),
-      date: row.FT_created,
-      pinned: Boolean(row.FT_is_locked) || row.FT_category === 'Объявления',
-      tags: row.FT_category ? row.FT_category.toLowerCase().split(/\s+/).slice(0, 3) : []
-    }));
+    const forumPosts = forumRows[0].map((row) => {
+      const messages = forumPostsByTopic.get(row.Forum_them_ID) || [];
+      return {
+        id: row.Forum_them_ID,
+        title: row.FT_name,
+        authorId: row.Author_ID ? Number(row.Author_ID) : null,
+        author: row.author_name,
+        department: row.department,
+        category: row.FT_category || 'Обсуждение',
+        replies: messages.length,
+        views: Number(row.FT_views_count || 0),
+        date: row.FT_created,
+        updatedAt: row.FT_created,
+        isLocked: Boolean(row.FT_is_locked),
+        pinned: Boolean(row.FT_is_locked) || row.FT_category === 'Объявления',
+        tags: row.FT_category ? row.FT_category.toLowerCase().split(/\s+/).slice(0, 3) : [],
+        messages
+      };
+    });
 
     const courses = courseRows[0].map((row) => {
       const content = safeJsonParse(row.C_content_structure, []);
+      const totalModules = countCourseModules(content);
       const moduleCount = Array.isArray(content) ? content.length : 0;
+      const totalLessons = countCourseLessons(content);
+      const enrollmentRow = enrollmentsByCourse.get(row.Course_ID);
+      const visibleToCurrentUser = canViewPeopleInsights
+        || !row.C_department_id
+        || Number(row.C_department_id) === Number(currentDepartmentId);
       return {
         id: row.Course_ID,
         title: row.C_name,
         description: row.C_description,
+        createdAt: row.C_created,
         duration: row.C_estimated_hours ? `${row.C_estimated_hours} ч` : 'Не указано',
         modules: moduleCount,
+        totalModules,
+        totalLessons,
         enrolled: Number(row.enrolled_count || 0),
         completed: Number(row.completed_count || 0),
         status: row.C_is_published ? 'active' : 'draft',
         category: row.C_category || 'Обучение',
-        instructor: `${row.creator_name} ${row.creator_surname}`.trim()
+        instructor: `${row.creator_name} ${row.creator_surname}`.trim(),
+        departmentId: row.C_department_id,
+        department: row.course_department_name,
+        visibleToCurrentUser,
+        contentUrl: row.C_content_url,
+        contentStructure: content,
+        myEnrollment: mapEnrollment(enrollmentRow, totalLessons),
+        participants: canViewPeopleInsights ? (enrollmentsByCourseAll.get(row.Course_ID) || []) : []
       };
     });
 
     const employeeCount = employees.length || 1;
-    const surveys = surveyRows[0].map((row) => ({
-      id: row.Opros_ID,
-      title: row.O_title,
-      type: row.O_type === 'feedback' ? 'survey' : row.O_type,
-      status: row.O_is_active ? 'active' : 'completed',
-      responses: Number(row.response_count || 0),
-      total: employeeCount,
-      deadline: row.O_end_date,
-      createdBy: `${row.creator_name} ${row.creator_surname}`.trim(),
-      description: row.O_description
-    }));
+    const surveys = surveyRows[0].map((row) => {
+      const resultRow = resultsBySurvey.get(row.Opros_ID);
+      return {
+        id: row.Opros_ID,
+        title: row.O_title,
+        type: row.O_type === 'feedback' ? 'survey' : row.O_type,
+        status: row.O_is_active ? 'active' : 'completed',
+        responses: Number(row.response_count || 0),
+        total: employeeCount,
+        deadline: row.O_end_date,
+        createdBy: `${row.creator_name} ${row.creator_surname}`.trim(),
+        description: row.O_description,
+        departmentId: row.O_department_id,
+        department: row.survey_department_name,
+        visibleToCurrentUser: canViewPeopleInsights
+          || !row.O_department_id
+          || Number(row.O_department_id) === Number(currentDepartmentId),
+        questions: safeJsonParse(row.O_questions, []),
+        myResult: mapSurveyResult(resultRow),
+        submissions: canViewPeopleInsights ? (resultsBySurveyAll.get(row.Opros_ID) || []) : []
+      };
+    });
+
+    const scopedEmployees = canViewPeopleInsights
+      ? employees
+      : employees.filter((employee) => Number(employee.id) === Number(req.user.userId));
+
+    const scopedDepartments = canViewPeopleInsights
+      ? departments
+      : departments.filter((department) => Number(department.id) === Number(currentDepartmentId));
+
+    const scopedTasks = canViewPeopleInsights
+      ? tasks
+      : tasks.filter((task) =>
+        Number(task.assigneeId) === Number(req.user.userId)
+        || (task.assigneeId === null && Number(task.departmentId) === Number(currentDepartmentId))
+      );
+
+    const scopedAppeals = canViewPeopleInsights
+      ? appeals
+      : appeals.filter((appeal) => Number(appeal.authorId) === Number(req.user.userId));
+
+    const scopedForumPosts = forumPosts;
+
+    const scopedCourses = courses.filter((course) => course.visibleToCurrentUser);
+    const scopedSurveys = surveys.filter((survey) => survey.visibleToCurrentUser);
 
     const lastMonths = getLastMonths(6);
 
@@ -487,40 +937,40 @@ exports.getBootstrap = async (req, res) => {
       courses: 0
     }]));
 
-    taskRows[0].forEach((row) => {
-      const date = new Date(row.T_created);
+    scopedTasks.forEach((task) => {
+      const date = new Date(task.createdAt);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (monthlyMap.has(key)) {
         monthlyMap.get(key).tasks += 1;
       }
     });
 
-    appealRows[0].forEach((row) => {
-      const date = new Date(row.A_created);
+    scopedAppeals.forEach((appeal) => {
+      const date = new Date(appeal.date);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (monthlyMap.has(key)) {
         monthlyMap.get(key).appeals += 1;
       }
     });
 
-    employeeRows[0].forEach((row) => {
-      const date = new Date(row.U_hire_date);
+    scopedEmployees.forEach((employee) => {
+      const date = new Date(employee.hireDate);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (monthlyMap.has(key)) {
         monthlyMap.get(key).hires += 1;
       }
     });
 
-    forumRows[0].forEach((row) => {
-      const date = new Date(row.FT_created);
+    scopedForumPosts.forEach((post) => {
+      const date = new Date(post.date);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (monthlyMap.has(key)) {
         monthlyMap.get(key).forum += 1;
       }
     });
 
-    courseRows[0].forEach((row) => {
-      const date = new Date(row.C_created);
+    scopedCourses.forEach((course) => {
+      const date = new Date(course.createdAt || course.created || null);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (monthlyMap.has(key)) {
         monthlyMap.get(key).courses += 1;
@@ -531,23 +981,23 @@ exports.getBootstrap = async (req, res) => {
 
     const departmentMonthlyMap = new Map(lastMonths.map((month) => [month.key, { month: month.label }]));
 
-    departments.forEach((department) => {
+    scopedDepartments.forEach((department) => {
       lastMonths.forEach((month) => {
         departmentMonthlyMap.get(month.key)[department.code || department.name] = 0;
       });
     });
 
-    taskRows[0].forEach((row) => {
-      if (!row.department_name) {
+    scopedTasks.forEach((task) => {
+      if (!task.department) {
         return;
       }
 
-      const department = departments.find((item) => item.name === row.department_name);
+      const department = scopedDepartments.find((item) => item.name === task.department);
       if (!department) {
         return;
       }
 
-      const date = new Date(row.T_created);
+      const date = new Date(task.createdAt);
       const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
       if (departmentMonthlyMap.has(key)) {
         departmentMonthlyMap.get(key)[department.code || department.name] += 1;
@@ -559,13 +1009,16 @@ exports.getBootstrap = async (req, res) => {
     res.json({
       success: true,
       data: {
-        employees,
-        departments,
-        tasks,
-        appeals,
-        forumPosts,
-        courses,
-        surveys,
+        currentUserRole: currentRoleName,
+        currentUserDepartmentId: currentDepartmentId,
+        currentUserDepartmentName: currentDepartmentName,
+        employees: scopedEmployees,
+        departments: scopedDepartments,
+        tasks: scopedTasks,
+        appeals: scopedAppeals,
+        forumPosts: scopedForumPosts,
+        courses: scopedCourses,
+        surveys: scopedSurveys,
         monthlyStats,
         departmentMonthlyStats
       }
@@ -576,6 +1029,260 @@ exports.getBootstrap = async (req, res) => {
       success: false,
       error: 'Ошибка сервера при загрузке данных рабочего пространства'
     });
+  }
+};
+
+exports.createAppeal = async (req, res) => {
+  const type = `${req.body.type || ''}`.trim().toLowerCase();
+  const category = `${req.body.category || ''}`.trim();
+  const priority = `${req.body.priority || ''}`.trim().toLowerCase();
+  const content = `${req.body.content || ''}`.trim();
+  const recipientId = Number(req.body.recipientId || 0);
+  const isAnonymous = Boolean(req.body.isAnonymous);
+  const isConfidential = Boolean(req.body.isConfidential);
+
+  const allowedTypes = ['complaint', 'suggestion', 'question'];
+  const allowedPriorities = ['low', 'medium', 'high'];
+
+  if (!allowedTypes.includes(type)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный тип обращения'
+    });
+  }
+
+  if (!allowedPriorities.includes(priority)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный приоритет обращения'
+    });
+  }
+
+  if (!category || category.length < 3) {
+    return res.status(400).json({
+      success: false,
+      error: 'Укажите тему обращения не короче 3 символов'
+    });
+  }
+
+  if (!content || content.length < 10) {
+    return res.status(400).json({
+      success: false,
+      error: 'Текст обращения должен содержать не менее 10 символов'
+    });
+  }
+
+  if (!recipientId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Выберите получателя обращения'
+    });
+  }
+
+  try {
+    const [recipientRows] = await pool.query(
+      `SELECT u.User_ID, u.U_is_active, r.R_name
+       FROM user u
+       JOIN role r ON r.Role_ID = u.Role_ID
+       WHERE u.User_ID = ?
+       LIMIT 1`,
+      [recipientId]
+    );
+
+    const recipient = recipientRows[0];
+
+    if (!recipient || !recipient.U_is_active) {
+      return res.status(404).json({
+        success: false,
+        error: 'Получатель обращения не найден'
+      });
+    }
+
+    if (!isAppealManager(recipient.R_name)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Получателем обращения может быть только HR или администратор'
+      });
+    }
+
+    const [insertResult] = await pool.query(
+      `INSERT INTO appeal (
+        User_ID,
+        A_type,
+        A_category,
+        A_priority,
+        A_content,
+        A_status,
+        A_responder_id,
+        A_is_anonymous,
+        A_is_confidential
+      ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?)`,
+      [req.user.userId, type, category, priority, content, recipientId, isAnonymous ? 1 : 0, isConfidential ? 1 : 0]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Обращение создано',
+      data: {
+        id: insertResult.insertId
+      }
+    });
+  } catch (error) {
+    console.error('Create appeal error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании обращения'
+    });
+  }
+};
+
+exports.createForumTopic = async (req, res) => {
+  const title = `${req.body.title || ''}`.trim();
+  const category = `${req.body.category || ''}`.trim();
+  const content = `${req.body.content || ''}`.trim();
+
+  if (!title || title.length < 5) {
+    return res.status(400).json({
+      success: false,
+      error: 'Укажите название темы не короче 5 символов'
+    });
+  }
+
+  if (!content || content.length < 5) {
+    return res.status(400).json({
+      success: false,
+      error: 'Введите сообщение темы не короче 5 символов'
+    });
+  }
+
+  let connection;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [topicResult] = await connection.query(
+      `INSERT INTO forum_them (Author_ID, FT_name, FT_category, FT_posts_count)
+       VALUES (?, ?, ?, 1)`,
+      [req.user.userId, title, category || 'Обсуждение']
+    );
+
+    await connection.query(
+      `INSERT INTO forum_posts (Forum_them_ID, Author_ID, FP_content)
+       VALUES (?, ?, ?)`,
+      [topicResult.insertId, req.user.userId, content]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      success: true,
+      message: 'Тема форума создана',
+      data: {
+        id: topicResult.insertId
+      }
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    console.error('Create forum topic error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании темы форума'
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+};
+
+exports.createForumPost = async (req, res) => {
+  const topicId = Number(req.params.id);
+  const content = `${req.body.content || ''}`.trim();
+
+  if (!topicId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор темы'
+    });
+  }
+
+  if (!content || content.length < 1) {
+    return res.status(400).json({
+      success: false,
+      error: 'Сообщение не должно быть пустым'
+    });
+  }
+
+  let connection;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    const [topicRows] = await connection.query(
+      `SELECT Forum_them_ID, FT_is_locked
+       FROM forum_them
+       WHERE Forum_them_ID = ?
+       LIMIT 1`,
+      [topicId]
+    );
+
+    const topic = topicRows[0];
+
+    if (!topic) {
+      await connection.rollback();
+      return res.status(404).json({
+        success: false,
+        error: 'Тема форума не найдена'
+      });
+    }
+
+    if (topic.FT_is_locked) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        error: 'Тема закрыта для новых сообщений'
+      });
+    }
+
+    await connection.query(
+      `INSERT INTO forum_posts (Forum_them_ID, Author_ID, FP_content)
+       VALUES (?, ?, ?)`,
+      [topicId, req.user.userId, content]
+    );
+
+    await connection.query(
+      `UPDATE forum_them
+       SET FT_posts_count = FT_posts_count + 1,
+           FT_updated = NOW()
+       WHERE Forum_them_ID = ?`,
+      [topicId]
+    );
+
+    await connection.commit();
+
+    res.status(201).json({
+      success: true,
+      message: 'Сообщение на форуме отправлено'
+    });
+  } catch (error) {
+    if (connection) {
+      await connection.rollback();
+    }
+
+    console.error('Create forum post error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при отправке сообщения на форум'
+    });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
   }
 };
 
@@ -797,5 +1504,349 @@ exports.sendAppealMessage = async (req, res) => {
     if (connection) {
       connection.release();
     }
+  }
+};
+
+exports.submitSurvey = async (req, res) => {
+  const surveyId = Number(req.params.id);
+  const answers = req.body.answers;
+
+  if (!surveyId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор опроса'
+    });
+  }
+
+  try {
+    const [surveyRows] = await pool.query(
+      `SELECT Opros_ID, O_type, O_questions, O_is_active, O_start_date, O_end_date
+       FROM opros
+       WHERE Opros_ID = ?
+       LIMIT 1`,
+      [surveyId]
+    );
+
+    if (!surveyRows.length) {
+      return res.status(404).json({
+        success: false,
+        error: 'Опрос не найден'
+      });
+    }
+
+    const survey = surveyRows[0];
+    const now = new Date();
+
+    if (!survey.O_is_active) {
+      return res.status(400).json({
+        success: false,
+        error: 'Этот опрос уже закрыт'
+      });
+    }
+
+    if (survey.O_start_date && new Date(survey.O_start_date) > now) {
+      return res.status(400).json({
+        success: false,
+        error: 'Опрос ещё не доступен для прохождения'
+      });
+    }
+
+    if (survey.O_end_date && new Date(survey.O_end_date) < now) {
+      return res.status(400).json({
+        success: false,
+        error: 'Срок прохождения опроса истёк'
+      });
+    }
+
+    const questions = safeJsonParse(survey.O_questions, []);
+    const normalizedAnswers = normalizeSurveyAnswers(questions, answers);
+    const missingRequiredQuestion = questions.find((question) => {
+      if (!question.required) {
+        return false;
+      }
+
+      const currentAnswer = normalizedAnswers.find((item) => Number(item.question_id) === Number(question.id));
+      return !currentAnswer || isEmptyAnswer(currentAnswer.answer);
+    });
+
+    if (missingRequiredQuestion) {
+      return res.status(400).json({
+        success: false,
+        error: `Заполните обязательный вопрос: ${missingRequiredQuestion.text}`
+      });
+    }
+
+    const score = calculateSurveyScore(survey.O_type, questions, normalizedAnswers);
+
+    await pool.query(
+      `INSERT INTO opros_result (
+        Opros_ID, User_ID, OR_answers, SR_score, OR_is_completed, OR_started_at, OR_submitted_at, OR_ip_address, OR_device_info
+      ) VALUES (?, ?, ?, ?, 1, NOW(), NOW(), ?, ?)
+      ON DUPLICATE KEY UPDATE
+        OR_answers = VALUES(OR_answers),
+        SR_score = VALUES(SR_score),
+        OR_is_completed = 1,
+        OR_submitted_at = NOW(),
+        OR_ip_address = VALUES(OR_ip_address),
+        OR_device_info = VALUES(OR_device_info)`,
+      [
+        surveyId,
+        req.user.userId,
+        JSON.stringify(normalizedAnswers),
+        score,
+        req.ip || null,
+        `${req.headers['user-agent'] || ''}`.slice(0, 100) || null
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: 'Опрос сохранён',
+      data: {
+        score,
+        answers: normalizedAnswers
+      }
+    });
+  } catch (error) {
+    console.error('Submit survey error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при сохранении опроса'
+    });
+  }
+};
+
+exports.startCourse = async (req, res) => {
+  const courseId = Number(req.params.id);
+
+  if (!courseId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор курса'
+    });
+  }
+
+  try {
+    const [courseRows] = await pool.query(
+      `SELECT Course_ID, C_content_structure, C_is_published
+       FROM course
+       WHERE Course_ID = ?
+       LIMIT 1`,
+      [courseId]
+    );
+
+    if (!courseRows.length) {
+      return res.status(404).json({
+        success: false,
+        error: 'Курс не найден'
+      });
+    }
+
+    const course = courseRows[0];
+    if (!course.C_is_published) {
+      return res.status(400).json({
+        success: false,
+        error: 'Курс пока не опубликован'
+      });
+    }
+
+    const content = safeJsonParse(course.C_content_structure, []);
+    const totalModules = Math.max(countCourseModules(content), 1);
+
+    const [existingRows] = await pool.query(
+      `SELECT Enrollment_ID, E_current_lesson_index, E_progress_percent, E_completed_lessons, E_total_lessons,
+              E_final_score, E_is_completed, E_is_certified, E_enrolled_at, E_last_accessed, E_completed_at
+       FROM enrollment
+       WHERE User_ID = ? AND Course_ID = ?
+       LIMIT 1`,
+      [req.user.userId, courseId]
+    );
+
+    if (existingRows.length) {
+      await pool.query(
+        `UPDATE enrollment
+         SET E_last_accessed = NOW()
+         WHERE Enrollment_ID = ?`,
+        [existingRows[0].Enrollment_ID]
+      );
+
+      return res.json({
+        success: true,
+        message: 'Курс уже начат',
+        data: {
+          enrollment: {
+            id: existingRows[0].Enrollment_ID,
+            currentLessonIndex: Number(existingRows[0].E_current_lesson_index || 0),
+            currentModuleIndex: Number(existingRows[0].E_current_lesson_index || 0),
+            progressPercent: Number(existingRows[0].E_progress_percent || 0),
+            completedLessons: Number(existingRows[0].E_completed_lessons || 0),
+            completedModules: Number(existingRows[0].E_completed_lessons || 0),
+            totalLessons: Number(existingRows[0].E_total_lessons || totalModules),
+            totalModules: Number(existingRows[0].E_total_lessons || totalModules),
+            finalScore: existingRows[0].E_final_score === null ? null : Number(existingRows[0].E_final_score),
+            isCompleted: Boolean(existingRows[0].E_is_completed),
+            isCertified: Boolean(existingRows[0].E_is_certified),
+            enrolledAt: existingRows[0].E_enrolled_at,
+            lastAccessed: existingRows[0].E_last_accessed,
+            completedAt: existingRows[0].E_completed_at
+          }
+        }
+      });
+    }
+
+    const [insertResult] = await pool.query(
+      `INSERT INTO enrollment (
+        User_ID, Course_ID, E_current_lesson_index, E_progress_percent, E_completed_lessons, E_total_lessons,
+        E_final_score, E_is_completed, E_is_certified, E_enrolled_at, E_last_accessed, E_completed_at
+      ) VALUES (?, ?, 0, 0, 0, ?, NULL, 0, 0, NOW(), NOW(), NULL)`,
+      [req.user.userId, courseId, totalModules]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Вы записаны на курс',
+      data: {
+        enrollment: {
+          id: insertResult.insertId,
+          currentLessonIndex: 0,
+          currentModuleIndex: 0,
+          progressPercent: 0,
+          completedLessons: 0,
+          completedModules: 0,
+          totalLessons: totalModules,
+          totalModules,
+          finalScore: null,
+          isCompleted: false,
+          isCertified: false,
+          enrolledAt: new Date().toISOString(),
+          lastAccessed: new Date().toISOString(),
+          completedAt: null
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Start course error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при запуске курса'
+    });
+  }
+};
+
+exports.advanceCourseProgress = async (req, res) => {
+  const courseId = Number(req.params.id);
+
+  if (!courseId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор курса'
+    });
+  }
+
+  try {
+    const [courseRows] = await pool.query(
+      `SELECT Course_ID, C_content_structure, C_is_published
+       FROM course
+       WHERE Course_ID = ?
+       LIMIT 1`,
+      [courseId]
+    );
+
+    if (!courseRows.length) {
+      return res.status(404).json({
+        success: false,
+        error: 'Курс не найден'
+      });
+    }
+
+    if (!courseRows[0].C_is_published) {
+      return res.status(400).json({
+        success: false,
+        error: 'Курс пока не опубликован'
+      });
+    }
+
+    const totalModules = Math.max(countCourseModules(safeJsonParse(courseRows[0].C_content_structure, [])), 1);
+    const [enrollmentRows] = await pool.query(
+      `SELECT Enrollment_ID, E_current_lesson_index, E_progress_percent, E_completed_lessons, E_total_lessons, E_is_completed
+       FROM enrollment
+       WHERE User_ID = ? AND Course_ID = ?
+       LIMIT 1`,
+      [req.user.userId, courseId]
+    );
+
+    if (!enrollmentRows.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'Сначала начните курс'
+      });
+    }
+
+    const enrollment = enrollmentRows[0];
+    if (enrollment.E_is_completed) {
+      return res.json({
+        success: true,
+        message: 'Курс уже завершён',
+        data: {
+          progressPercent: 100,
+          completedLessons: Number(enrollment.E_total_lessons || totalModules),
+          completedModules: Number(enrollment.E_total_lessons || totalModules),
+          totalLessons: Number(enrollment.E_total_lessons || totalModules),
+          totalModules: Number(enrollment.E_total_lessons || totalModules),
+          currentLessonIndex: Math.max(Number(enrollment.E_total_lessons || totalModules) - 1, 0),
+          currentModuleIndex: Math.max(Number(enrollment.E_total_lessons || totalModules) - 1, 0),
+          isCompleted: true
+        }
+      });
+    }
+
+    const nextCompletedLessons = Math.min(Number(enrollment.E_completed_lessons || 0) + 1, Number(enrollment.E_total_lessons || totalModules));
+    const nextProgressPercent = Math.round((nextCompletedLessons / Number(enrollment.E_total_lessons || totalModules)) * 100);
+    const isCompleted = nextCompletedLessons >= Number(enrollment.E_total_lessons || totalModules);
+    const nextLessonIndex = isCompleted
+      ? Math.max(Number(enrollment.E_total_lessons || totalModules) - 1, 0)
+      : nextCompletedLessons;
+
+    await pool.query(
+      `UPDATE enrollment
+       SET E_current_lesson_index = ?,
+           E_progress_percent = ?,
+           E_completed_lessons = ?,
+           E_is_completed = ?,
+           E_final_score = CASE WHEN ? THEN 100 ELSE E_final_score END,
+           E_last_accessed = NOW(),
+           E_completed_at = CASE WHEN ? THEN COALESCE(E_completed_at, NOW()) ELSE NULL END
+       WHERE Enrollment_ID = ?`,
+      [
+        nextLessonIndex,
+        nextProgressPercent,
+        nextCompletedLessons,
+        isCompleted ? 1 : 0,
+        isCompleted ? 1 : 0,
+        isCompleted ? 1 : 0,
+        enrollment.Enrollment_ID
+      ]
+    );
+
+    res.json({
+      success: true,
+      message: isCompleted ? 'Курс завершён' : 'Прогресс обновлён',
+      data: {
+        progressPercent: nextProgressPercent,
+        completedLessons: nextCompletedLessons,
+        completedModules: nextCompletedLessons,
+        totalLessons: Number(enrollment.E_total_lessons || totalModules),
+        totalModules: Number(enrollment.E_total_lessons || totalModules),
+        currentLessonIndex: nextLessonIndex,
+        currentModuleIndex: nextLessonIndex,
+        isCompleted
+      }
+    });
+  } catch (error) {
+    console.error('Advance course progress error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при обновлении прогресса курса'
+    });
   }
 };
