@@ -6,6 +6,12 @@ const router = express.Router();
 
 router.get('/data', authenticate, workspaceController.getBootstrap);
 router.get('/bootstrap', authenticate, workspaceController.getBootstrap);
+router.put('/notifications/read-all', authenticate, workspaceController.markNotificationsRead);
+router.post('/departments', authenticate, workspaceController.createDepartment);
+router.post('/employees', authenticate, workspaceController.createEmployee);
+router.post('/tests', authenticate, workspaceController.createTest);
+router.post('/tasks', authenticate, workspaceController.createTask);
+router.put('/tasks/:id/complete', authenticate, workspaceController.completeTask);
 router.post('/forum/topics', authenticate, workspaceController.createForumTopic);
 router.post('/forum/topics/:id/posts', authenticate, workspaceController.createForumPost);
 router.post('/appeals', authenticate, workspaceController.createAppeal);

@@ -1,9 +1,11 @@
 const { pool } = require('../config/database');
+const { hashPassword, validatePasswordStrength } = require('../utils/password');
 
 const DEPARTMENT_COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#14b8a6', '#f97316', '#8b5cf6', '#0ea5e9'];
 const MANAGER_ROLES = ['hr', 'admin'];
 
 let ensureAppealMessagesTablePromise;
+let ensureNotificationsTablePromise;
 
 const getInitials = (firstName = '', lastName = '') =>
   `${firstName.charAt(0)}${lastName.charAt(0)}`.toUpperCase() || 'HR';
@@ -232,6 +234,69 @@ const ensureAppealMessagesTable = async () => {
   await ensureAppealMessagesTablePromise;
 };
 
+const ensureNotificationsTable = async () => {
+  if (!ensureNotificationsTablePromise) {
+    ensureNotificationsTablePromise = pool.query(
+      `CREATE TABLE IF NOT EXISTS notification (
+        Notification_ID INT NOT NULL AUTO_INCREMENT,
+        User_ID INT NOT NULL,
+        N_type VARCHAR(50) NOT NULL,
+        N_title VARCHAR(200) NOT NULL,
+        N_message TEXT NOT NULL,
+        N_link VARCHAR(255) DEFAULT NULL,
+        N_is_read TINYINT(1) DEFAULT 0,
+        N_created DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (Notification_ID),
+        KEY idx_notification_user (User_ID),
+        KEY idx_notification_read (N_is_read),
+        KEY idx_notification_created (N_created),
+        CONSTRAINT fk_notification_user FOREIGN KEY (User_ID) REFERENCES user (User_ID) ON DELETE CASCADE ON UPDATE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`
+    ).catch((error) => {
+      ensureNotificationsTablePromise = null;
+      throw error;
+    });
+  }
+
+  await ensureNotificationsTablePromise;
+};
+
+const createNotification = async (executor, { userId, type, title, message, link = null }) => {
+  if (!userId || !title || !message) {
+    return;
+  }
+
+  await executor.query(
+    `INSERT INTO notification (User_ID, N_type, N_title, N_message, N_link)
+     VALUES (?, ?, ?, ?, ?)`,
+    [userId, type || 'system', title, message, link]
+  );
+};
+
+const formatNotificationTime = (value) => {
+  if (!value) {
+    return 'Только что';
+  }
+
+  const createdAt = new Date(value);
+  const diffMinutes = Math.max(0, Math.round((Date.now() - createdAt.getTime()) / 60000));
+
+  if (diffMinutes < 1) {
+    return 'Только что';
+  }
+  if (diffMinutes < 60) {
+    return `${diffMinutes} мин назад`;
+  }
+
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) {
+    return `${diffHours} ч назад`;
+  }
+
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays} дн назад`;
+};
+
 const buildPersistedMessage = (row) => ({
   id: row.Appeal_Message_ID,
   appealId: row.Appeal_ID,
@@ -317,6 +382,7 @@ const fetchInsertedMessage = async (executor, messageId) => {
 exports.getBootstrap = async (req, res) => {
   try {
     await ensureAppealMessagesTable();
+    await ensureNotificationsTable();
     const [currentUserRows] = await pool.query(
       `SELECT r.R_name, u.Department_ID, d.D_name AS department_name
        FROM user u
@@ -331,7 +397,7 @@ exports.getBootstrap = async (req, res) => {
     const currentDepartmentName = currentUserRows[0]?.department_name || null;
     const canViewPeopleInsights = isAppealManager(currentRoleName);
 
-    const [employeeRows, departmentRows, taskRows, appealRows, forumRows, courseRows, surveyRows] = await Promise.all([
+    const [employeeRows, departmentRows, taskRows, appealRows, forumRows, courseRows, surveyRows, appealRecipientRows] = await Promise.all([
       pool.query(
         `SELECT
           u.User_ID, u.U_name, u.U_surname, u.U_lastname, u.U_email, u.U_phone, u.U_hire_date,
@@ -402,7 +468,7 @@ exports.getBootstrap = async (req, res) => {
       ),
       pool.query(
         `SELECT
-          t.Task_ID, t.T_title, t.T_description, t.T_priority, t.T_status, t.T_deadline, t.T_created,
+          t.Task_ID, t.T_title, t.T_description, t.T_priority, t.T_status, t.T_deadline, t.T_created, t.T_completed_at,
           t.T_assignee_user_id, t.T_assignee_dept_id,
           d.D_name AS department_name,
           CONCAT(au.U_name, ' ', au.U_surname) AS assignee_name,
@@ -464,6 +530,19 @@ exports.getBootstrap = async (req, res) => {
         LEFT JOIN opros_result r ON r.Opros_ID = o.Opros_ID
         GROUP BY o.Opros_ID
         ORDER BY o.O_created DESC`
+      ),
+      pool.query(
+        `SELECT
+          u.User_ID,
+          CONCAT(u.U_surname, ' ', u.U_name, IF(u.U_lastname IS NOT NULL AND u.U_lastname <> '', CONCAT(' ', u.U_lastname), '')) AS full_name,
+          r.R_name AS role_name,
+          d.D_name AS department_name
+        FROM user u
+        JOIN role r ON r.Role_ID = u.Role_ID
+        LEFT JOIN department d ON d.Department_ID = u.Department_ID
+        WHERE u.U_is_active = TRUE
+          AND LOWER(r.R_name) IN ('hr', 'admin')
+        ORDER BY full_name ASC`
       )
     ]);
 
@@ -485,6 +564,15 @@ exports.getBootstrap = async (req, res) => {
         [appealIds]
       )
       : [[]];
+
+    const [notificationRows] = await pool.query(
+      `SELECT Notification_ID, N_type, N_title, N_message, N_link, N_is_read, N_created
+       FROM notification
+       WHERE User_ID = ?
+       ORDER BY N_created DESC
+       LIMIT 20`,
+      [req.user.userId]
+    );
 
     const [forumPostRows] = forumTopicIds.length > 0
       ? await pool.query(
@@ -793,6 +881,7 @@ exports.getBootstrap = async (req, res) => {
         department: row.department_name || 'Без отдела',
         createdAt: row.T_created,
         deadline: row.T_deadline,
+        completedAt: row.T_completed_at,
         status: mapTaskStatus(row.T_status),
         kpiWeight: Math.round(Number(metrics?.[0]?.weight || 0) * 100) || 0,
         priority: row.T_priority === 'urgent' ? 'high' : row.T_priority || 'medium'
@@ -912,16 +1001,19 @@ exports.getBootstrap = async (req, res) => {
 
     const scopedTasks = canViewPeopleInsights
       ? tasks
-      : tasks.filter((task) =>
-        Number(task.assigneeId) === Number(req.user.userId)
-        || (task.assigneeId === null && Number(task.departmentId) === Number(currentDepartmentId))
-      );
+      : tasks.filter((task) => Number(task.assigneeId) === Number(req.user.userId));
 
     const scopedAppeals = canViewPeopleInsights
       ? appeals
       : appeals.filter((appeal) => Number(appeal.authorId) === Number(req.user.userId));
 
     const scopedForumPosts = forumPosts;
+    const appealRecipients = appealRecipientRows[0].map((row) => ({
+      id: row.User_ID,
+      name: row.full_name,
+      role: row.role_name,
+      department: row.department_name
+    }));
 
     const scopedCourses = courses.filter((course) => course.visibleToCurrentUser);
     const scopedSurveys = surveys.filter((survey) => survey.visibleToCurrentUser);
@@ -1005,6 +1097,16 @@ exports.getBootstrap = async (req, res) => {
     });
 
     const departmentMonthlyStats = lastMonths.map((month) => departmentMonthlyMap.get(month.key));
+    const notifications = notificationRows.map((row) => ({
+      id: row.Notification_ID,
+      type: row.N_type,
+      title: row.N_title,
+      text: row.N_message,
+      link: row.N_link,
+      unread: !row.N_is_read,
+      createdAt: row.N_created,
+      time: formatNotificationTime(row.N_created)
+    }));
 
     res.json({
       success: true,
@@ -1017,8 +1119,10 @@ exports.getBootstrap = async (req, res) => {
         tasks: scopedTasks,
         appeals: scopedAppeals,
         forumPosts: scopedForumPosts,
+        appealRecipients,
         courses: scopedCourses,
         surveys: scopedSurveys,
+        notifications,
         monthlyStats,
         departmentMonthlyStats
       }
@@ -1080,6 +1184,7 @@ exports.createAppeal = async (req, res) => {
   }
 
   try {
+    await ensureNotificationsTable();
     const [recipientRows] = await pool.query(
       `SELECT u.User_ID, u.U_is_active, r.R_name
        FROM user u
@@ -1119,6 +1224,14 @@ exports.createAppeal = async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?, ?)`,
       [req.user.userId, type, category, priority, content, recipientId, isAnonymous ? 1 : 0, isConfidential ? 1 : 0]
     );
+
+    await createNotification(pool, {
+      userId: recipientId,
+      type: 'appeal_created',
+      title: 'Новое обращение',
+      message: `Поступило новое обращение "${category}"`,
+      link: '/appeals'
+    });
 
     res.status(201).json({
       success: true,
@@ -1196,6 +1309,579 @@ exports.createForumTopic = async (req, res) => {
     if (connection) {
       connection.release();
     }
+  }
+};
+
+exports.createTask = async (req, res) => {
+  const title = `${req.body.title || ''}`.trim();
+  const description = `${req.body.description || ''}`.trim();
+  const priority = `${req.body.priority || ''}`.trim().toLowerCase();
+  const deadline = `${req.body.deadline || ''}`.trim();
+  const assigneeId = Number(req.body.assigneeId || 0);
+  const kpiWeight = Math.max(0, Math.min(100, Number(req.body.kpiWeight || 0)));
+
+  if (!title || title.length < 3) {
+    return res.status(400).json({
+      success: false,
+      error: 'Укажите название задачи не короче 3 символов'
+    });
+  }
+
+  if (!description || description.length < 5) {
+    return res.status(400).json({
+      success: false,
+      error: 'Описание задачи должно содержать не менее 5 символов'
+    });
+  }
+
+  if (!assigneeId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Выберите сотрудника для задачи'
+    });
+  }
+
+  if (!deadline) {
+    return res.status(400).json({
+      success: false,
+      error: 'Укажите срок выполнения задачи'
+    });
+  }
+
+  if (!['low', 'medium', 'high', 'urgent'].includes(priority)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный приоритет задачи'
+    });
+  }
+
+  try {
+    const [creatorRows, assigneeRows] = await Promise.all([
+      pool.query(
+        `SELECT u.User_ID, r.R_name
+         FROM user u
+         JOIN role r ON r.Role_ID = u.Role_ID
+         WHERE u.User_ID = ?
+         LIMIT 1`,
+        [req.user.userId]
+      ),
+      pool.query(
+        `SELECT User_ID, Department_ID, U_is_active
+         FROM user
+         WHERE User_ID = ?
+         LIMIT 1`,
+        [assigneeId]
+      )
+    ]);
+
+    const creator = creatorRows[0][0];
+    const assignee = assigneeRows[0][0];
+
+    if (!creator || !isAppealManager(creator.R_name)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Создавать задачи могут только HR и администратор'
+      });
+    }
+
+    if (!assignee || !assignee.U_is_active) {
+      return res.status(404).json({
+        success: false,
+        error: 'Сотрудник для задачи не найден'
+      });
+    }
+
+    const [insertResult] = await pool.query(
+      `INSERT INTO task (
+        T_title,
+        T_description,
+        T_priority,
+        T_status,
+        T_assignee_user_id,
+        T_assignee_dept_id,
+        T_creator_id,
+        T_deadline,
+        T_kpi_metrics
+      ) VALUES (?, ?, ?, 'todo', ?, ?, ?, ?, ?)`,
+      [
+        title,
+        description,
+        priority,
+        assigneeId,
+        assignee.Department_ID || null,
+        req.user.userId,
+        deadline,
+        JSON.stringify([{ metric: 'completion', weight: kpiWeight / 100, target: 100 }])
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Задача создана',
+      data: {
+        id: insertResult.insertId
+      }
+    });
+  } catch (error) {
+    console.error('Create task error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании задачи'
+    });
+  }
+};
+
+exports.createDepartment = async (req, res) => {
+  const name = `${req.body.name || ''}`.trim();
+  const code = `${req.body.code || ''}`.trim().toUpperCase();
+  const description = `${req.body.description || ''}`.trim();
+  const headId = Number(req.body.headId || 0) || null;
+
+  try {
+    await ensureNotificationsTable();
+    const [creatorRows] = await pool.query(
+      `SELECT u.User_ID, r.R_name
+       FROM user u
+       JOIN role r ON r.Role_ID = u.Role_ID
+       WHERE u.User_ID = ?
+       LIMIT 1`,
+      [req.user.userId]
+    );
+
+    const creator = creatorRows[0];
+
+    if (!creator || !isAppealManager(creator.R_name)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Добавлять отделы могут только HR и администратор'
+      });
+    }
+
+    if (!name || name.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'Название отдела должно содержать минимум 2 символа'
+      });
+    }
+
+    if (!code || code.length < 2) {
+      return res.status(400).json({
+        success: false,
+        error: 'Код отдела должен содержать минимум 2 символа'
+      });
+    }
+
+    const [duplicateRows] = await pool.query(
+      `SELECT Department_ID
+       FROM department
+       WHERE D_name = ? OR D_code = ?
+       LIMIT 1`,
+      [name, code]
+    );
+
+    if (duplicateRows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'Отдел с таким названием или кодом уже существует'
+      });
+    }
+
+    if (headId) {
+      const [headRows] = await pool.query(
+        `SELECT User_ID
+         FROM user
+         WHERE User_ID = ? AND U_is_active = TRUE
+         LIMIT 1`,
+        [headId]
+      );
+
+      if (headRows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Руководитель отдела не найден'
+        });
+      }
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO department (D_name, D_code, D_description, D_head_id, D_is_active)
+       VALUES (?, ?, ?, ?, TRUE)`,
+      [name, code, description || null, headId]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Отдел создан',
+      data: {
+        id: result.insertId
+      }
+    });
+  } catch (error) {
+    console.error('Create department error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании отдела'
+    });
+  }
+};
+
+exports.markNotificationsRead = async (req, res) => {
+  try {
+    await ensureNotificationsTable();
+    await pool.query(
+      `UPDATE notification
+       SET N_is_read = 1
+       WHERE User_ID = ? AND N_is_read = 0`,
+      [req.user.userId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Уведомления отмечены как прочитанные'
+    });
+  } catch (error) {
+    console.error('Mark notifications read error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при обновлении уведомлений'
+    });
+  }
+};
+
+exports.createEmployee = async (req, res) => {
+  const {
+    login,
+    firstName,
+    lastName,
+    middleName,
+    email,
+    phone,
+    hireDate,
+    roleId,
+    departmentId,
+    password
+  } = req.body;
+
+  try {
+    await ensureNotificationsTable();
+    const [creatorRows] = await pool.query(
+      `SELECT u.User_ID, r.R_name
+       FROM user u
+       JOIN role r ON r.Role_ID = u.Role_ID
+       WHERE u.User_ID = ?
+       LIMIT 1`,
+      [req.user.userId]
+    );
+
+    const creator = creatorRows[0];
+
+    if (!creator || !isAppealManager(creator.R_name)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Добавлять сотрудников могут только HR и администратор'
+      });
+    }
+
+    const passwordValidation = validatePasswordStrength(password);
+    if (!passwordValidation.isValid) {
+      return res.status(400).json({
+        success: false,
+        error: 'Слабый пароль',
+        details: passwordValidation.errors
+      });
+    }
+
+    const normalizedEmail = `${email || ''}`.trim().toLowerCase();
+    const normalizedLogin = `${login || ''}`.trim().toLowerCase();
+    const normalizedFirstName = `${firstName || ''}`.trim();
+    const normalizedLastName = `${lastName || ''}`.trim();
+    const normalizedMiddleName = `${middleName || ''}`.trim() || null;
+    const normalizedPhone = `${phone || ''}`.trim() || null;
+
+    if (!normalizedLogin || !normalizedFirstName || !normalizedLastName || !normalizedEmail || !hireDate || !roleId || !departmentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Заполните все обязательные поля сотрудника'
+      });
+    }
+
+    const [existingUsers] = await pool.query(
+      'SELECT User_ID, U_email, U_login FROM user WHERE U_email = ? OR U_login = ?',
+      [normalizedEmail, normalizedLogin]
+    );
+
+    if (existingUsers.length > 0) {
+      return res.status(409).json({
+        success: false,
+        error: 'Пользователь с таким email или логином уже существует'
+      });
+    }
+
+    const [[roleRows], [departmentRows]] = await Promise.all([
+      pool.query('SELECT Role_ID FROM role WHERE Role_ID = ? LIMIT 1', [roleId]),
+      pool.query('SELECT Department_ID FROM department WHERE Department_ID = ? AND D_is_active = TRUE LIMIT 1', [departmentId])
+    ]);
+
+    if (roleRows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Выбранная роль не найдена'
+      });
+    }
+
+    if (departmentRows.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Выбранный отдел не найден'
+      });
+    }
+
+    const passwordHash = await hashPassword(password);
+
+    const [result] = await pool.query(
+      `INSERT INTO user (
+        U_login, U_password_hash, U_name, U_surname, U_lastname, U_email,
+        U_phone, U_hire_date, Role_ID, Department_ID, U_is_active
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+      [
+        normalizedLogin,
+        passwordHash,
+        normalizedFirstName,
+        normalizedLastName,
+        normalizedMiddleName,
+        normalizedEmail,
+        normalizedPhone,
+        hireDate,
+        roleId,
+        departmentId
+      ]
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Сотрудник создан',
+      data: {
+        id: result.insertId
+      }
+    });
+  } catch (error) {
+    console.error('Create employee error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании сотрудника'
+    });
+  }
+};
+
+exports.createTest = async (req, res) => {
+  const title = `${req.body.title || ''}`.trim();
+  const description = `${req.body.description || ''}`.trim();
+  const departmentId = Number(req.body.departmentId || 0) || null;
+  const endDate = `${req.body.endDate || ''}`.trim() || null;
+  const questions = Array.isArray(req.body.questions) ? req.body.questions : [];
+
+  try {
+    const [creatorRows] = await pool.query(
+      `SELECT u.User_ID, r.R_name
+       FROM user u
+       JOIN role r ON r.Role_ID = u.Role_ID
+       WHERE u.User_ID = ?
+       LIMIT 1`,
+      [req.user.userId]
+    );
+
+    const creator = creatorRows[0];
+
+    if (!creator || !isAppealManager(creator.R_name)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Создавать тесты могут только HR и администратор'
+      });
+    }
+
+    if (!title || title.length < 3) {
+      return res.status(400).json({
+        success: false,
+        error: 'Название теста должно содержать минимум 3 символа'
+      });
+    }
+
+    if (questions.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Добавьте хотя бы один вопрос'
+      });
+    }
+
+    const normalizedQuestions = questions.map((question, index) => ({
+      id: index + 1,
+      text: `${question.text || ''}`.trim(),
+      type: 'choice',
+      required: true,
+      points: Math.max(1, Number(question.points || 1)),
+      options: Array.isArray(question.options) ? question.options.map((option) => `${option || ''}`.trim()).filter(Boolean) : [],
+      correct: String(question.correct ?? '')
+    }));
+
+    const invalidQuestion = normalizedQuestions.find((question) => !question.text || question.options.length < 2 || question.correct === '');
+    if (invalidQuestion) {
+      return res.status(400).json({
+        success: false,
+        error: 'У каждого вопроса должны быть текст, минимум два варианта ответа и правильный вариант'
+      });
+    }
+
+    if (departmentId) {
+      const [departmentRows] = await pool.query(
+        'SELECT Department_ID FROM department WHERE Department_ID = ? AND D_is_active = TRUE LIMIT 1',
+        [departmentId]
+      );
+
+      if (departmentRows.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Выбранный отдел не найден'
+        });
+      }
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO opros (
+        O_title,
+        O_description,
+        O_created_by,
+        O_department_id,
+        O_type,
+        O_questions,
+        O_is_active,
+        O_start_date,
+        O_end_date
+      ) VALUES (?, ?, ?, ?, 'test', ?, TRUE, NOW(), ?)`,
+      [title, description || null, req.user.userId, departmentId, JSON.stringify(normalizedQuestions), endDate || null]
+    );
+
+    const [recipientRows] = await pool.query(
+      `SELECT User_ID
+       FROM user
+       WHERE U_is_active = TRUE
+         AND (? IS NULL OR Department_ID = ?)`,
+      [departmentId, departmentId]
+    );
+
+    for (const recipient of recipientRows) {
+      await createNotification(pool, {
+        userId: recipient.User_ID,
+        type: 'test_assigned',
+        title: 'Новый тест',
+        message: `Вам доступен новый тест "${title}"`,
+        link: '/surveys'
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Тест создан',
+      data: {
+        id: result.insertId
+      }
+    });
+  } catch (error) {
+    console.error('Create test error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при создании теста'
+    });
+  }
+};
+
+exports.completeTask = async (req, res) => {
+  const taskId = Number(req.params.id);
+
+  if (!taskId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор задачи'
+    });
+  }
+
+  try {
+    await ensureNotificationsTable();
+    const [taskRows] = await pool.query(
+      `SELECT Task_ID, T_assignee_user_id, T_status
+       FROM task
+       WHERE Task_ID = ?
+       LIMIT 1`,
+      [taskId]
+    );
+
+    const task = taskRows[0];
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        error: 'Задача не найдена'
+      });
+    }
+
+    if (Number(task.T_assignee_user_id) !== Number(req.user.userId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Вы можете завершать только свои задачи'
+      });
+    }
+
+    if (task.T_status === 'done') {
+      return res.json({
+        success: true,
+        message: 'Задача уже была завершена'
+      });
+    }
+
+    if (task.T_status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        error: 'Отменённую задачу нельзя завершить'
+      });
+    }
+
+    await pool.query(
+      `UPDATE task
+       SET T_status = 'done',
+           T_completed_at = NOW(),
+           T_updated = NOW()
+       WHERE Task_ID = ?`,
+      [taskId]
+    );
+
+    const [creatorRows] = await pool.query(
+      `SELECT T_creator_id, T_title
+       FROM task
+       WHERE Task_ID = ?
+       LIMIT 1`,
+      [taskId]
+    );
+
+    const creator = creatorRows[0];
+    if (creator?.T_creator_id) {
+      await createNotification(pool, {
+        userId: creator.T_creator_id,
+        type: 'task_completed',
+        title: 'Задача выполнена',
+        message: `Сотрудник завершил задачу "${creator.T_title}"`,
+        link: '/tasks'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Задача отмечена как завершённая'
+    });
+  } catch (error) {
+    console.error('Complete task error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при завершении задачи'
+    });
   }
 };
 
@@ -1312,6 +1998,7 @@ exports.updateAppeal = async (req, res) => {
 
   try {
     await ensureAppealMessagesTable();
+    await ensureNotificationsTable();
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
@@ -1366,6 +2053,16 @@ exports.updateAppeal = async (req, res) => {
       [normalizedStatus, trimmedResponse, trimmedResponse, req.user.userId, normalizedStatus, appealId]
     );
 
+    await createNotification(connection, {
+      userId: appeal.User_ID,
+      type: 'appeal_updated',
+      title: 'Обращение обновлено',
+      message: trimmedResponse
+        ? 'По вашему обращению поступил новый ответ'
+        : `Статус обращения изменён на ${mapAppealStatus(normalizedStatus)}`,
+      link: '/appeals'
+    });
+
     await connection.commit();
 
     res.json({
@@ -1415,6 +2112,7 @@ exports.sendAppealMessage = async (req, res) => {
 
   try {
     await ensureAppealMessagesTable();
+    await ensureNotificationsTable();
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
@@ -1478,6 +2176,14 @@ exports.sendAppealMessage = async (req, res) => {
       [nextStatus, manager ? 1 : 0, content, manager ? 1 : 0, req.user.userId, nextStatus, appealId]
     );
 
+    await createNotification(connection, {
+      userId: manager ? appeal.User_ID : (appeal.A_responder_id || null),
+      type: 'appeal_message',
+      title: manager ? 'Ответ по обращению' : 'Новое сообщение по обращению',
+      message: content.length > 80 ? `${content.slice(0, 80)}...` : content,
+      link: '/appeals'
+    });
+
     const message = await fetchInsertedMessage(connection, insertResult.insertId);
 
     await connection.commit();
@@ -1519,8 +2225,9 @@ exports.submitSurvey = async (req, res) => {
   }
 
   try {
+    await ensureNotificationsTable();
     const [surveyRows] = await pool.query(
-      `SELECT Opros_ID, O_type, O_questions, O_is_active, O_start_date, O_end_date
+      `SELECT Opros_ID, O_title, O_created_by, O_type, O_questions, O_is_active, O_start_date, O_end_date
        FROM opros
        WHERE Opros_ID = ?
        LIMIT 1`,
@@ -1598,6 +2305,18 @@ exports.submitSurvey = async (req, res) => {
         `${req.headers['user-agent'] || ''}`.slice(0, 100) || null
       ]
     );
+
+    if (survey.O_created_by) {
+      await createNotification(pool, {
+        userId: survey.O_created_by,
+        type: 'survey_completed',
+        title: survey.O_type === 'test' ? 'Тест пройден' : 'Опрос заполнен',
+        message: survey.O_type === 'test'
+          ? `Сотрудник завершил тест "${survey.O_title}" с результатом ${score}%`
+          : `Сотрудник отправил ответы по опросу "${survey.O_title}"`,
+        link: '/surveys'
+      });
+    }
 
     res.json({
       success: true,
@@ -1701,6 +2420,14 @@ exports.startCourse = async (req, res) => {
       ) VALUES (?, ?, 0, 0, 0, ?, NULL, 0, 0, NOW(), NOW(), NULL)`,
       [req.user.userId, courseId, totalModules]
     );
+
+    await createNotification(pool, {
+      userId: assigneeId,
+      type: 'task_assigned',
+      title: 'Новая задача',
+      message: `Вам назначена задача "${title}"`,
+      link: '/tasks'
+    });
 
     res.status(201).json({
       success: true,
