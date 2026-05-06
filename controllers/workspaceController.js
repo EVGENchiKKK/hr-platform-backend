@@ -1,5 +1,12 @@
 const { pool } = require('../config/database');
 const { hashPassword, validatePasswordStrength } = require('../utils/password');
+const {
+  emitAppealCreated,
+  emitAppealUpdated,
+  emitAppealMessage,
+  emitForumTopicCreated,
+  emitForumMessage,
+} = require('../socketServer');
 
 const DEPARTMENT_COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#14b8a6', '#f97316', '#8b5cf6', '#0ea5e9'];
 const MANAGER_ROLES = ['hr', 'admin'];
@@ -377,6 +384,190 @@ const fetchInsertedMessage = async (executor, messageId) => {
   );
 
   return rows[0] ? buildPersistedMessage(rows[0]) : null;
+};
+
+const fetchAppealsPayload = async (executor, userId) => {
+  await ensureAppealMessagesTable();
+
+  const [currentUserRows] = await executor.query(
+    `SELECT r.R_name
+     FROM user u
+     JOIN role r ON r.Role_ID = u.Role_ID
+     WHERE u.User_ID = ?
+     LIMIT 1`,
+    [userId]
+  );
+
+  const currentRoleName = normalizeRoleName(currentUserRows[0]?.R_name);
+  const canViewPeopleInsights = isAppealManager(currentRoleName);
+
+  const [appealRows, appealRecipientRows] = await Promise.all([
+    executor.query(
+      `SELECT
+        a.Appeal_ID, a.User_ID AS author_id, a.A_type, a.A_category, a.A_priority, a.A_content,
+        a.A_status, a.A_response, a.A_created, a.A_updated, a.A_closed_at, a.A_responder_id,
+        a.A_is_anonymous, a.A_is_confidential,
+        CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+        author_role.R_name AS author_role_name,
+        d.D_name AS department_name,
+        CONCAT(responder.U_name, ' ', responder.U_surname) AS responder_name,
+        responder_role.R_name AS responder_role_name
+      FROM appeal a
+      JOIN user u ON u.User_ID = a.User_ID
+      LEFT JOIN role author_role ON author_role.Role_ID = u.Role_ID
+      LEFT JOIN department d ON d.Department_ID = u.Department_ID
+      LEFT JOIN user responder ON responder.User_ID = a.A_responder_id
+      LEFT JOIN role responder_role ON responder_role.Role_ID = responder.Role_ID
+      ORDER BY a.A_created DESC`
+    ),
+    executor.query(
+      `SELECT
+        u.User_ID,
+        CONCAT(u.U_surname, ' ', u.U_name, IF(u.U_lastname IS NOT NULL AND u.U_lastname <> '', CONCAT(' ', u.U_lastname), '')) AS full_name,
+        r.R_name AS role_name,
+        d.D_name AS department_name
+      FROM user u
+      JOIN role r ON r.Role_ID = u.Role_ID
+      LEFT JOIN department d ON d.Department_ID = u.Department_ID
+      WHERE u.U_is_active = TRUE
+        AND LOWER(r.R_name) IN ('hr', 'admin')
+      ORDER BY full_name ASC`
+    )
+  ]);
+
+  const appealIds = appealRows[0].map((row) => row.Appeal_ID);
+  const [appealMessageRows] = appealIds.length > 0
+    ? await executor.query(
+      `SELECT
+        am.Appeal_Message_ID, am.Appeal_ID, am.Author_ID, am.AM_content, am.AM_created,
+        CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+        r.R_name AS role_name
+      FROM appeal_message am
+      JOIN user u ON u.User_ID = am.Author_ID
+      LEFT JOIN role r ON r.Role_ID = u.Role_ID
+      WHERE am.Appeal_ID IN (?)
+      ORDER BY am.AM_created ASC, am.Appeal_Message_ID ASC`,
+      [appealIds]
+    )
+    : [[]];
+
+  const messagesByAppeal = appealMessageRows.reduce((accumulator, row) => {
+    const currentMessages = accumulator.get(row.Appeal_ID) || [];
+    currentMessages.push(buildPersistedMessage(row));
+    accumulator.set(row.Appeal_ID, currentMessages);
+    return accumulator;
+  }, new Map());
+
+  const appeals = appealRows[0].map((row) => {
+    const persistedMessages = messagesByAppeal.get(row.Appeal_ID) || [];
+    const messages = buildAppealThread(row, persistedMessages);
+
+    return {
+      id: row.Appeal_ID,
+      authorId: row.author_id,
+      recipientId: row.A_responder_id ? Number(row.A_responder_id) : null,
+      recipientName: row.responder_name || 'Не назначен',
+      subject: buildAppealSubject(row),
+      from: row.author_name,
+      department: row.department_name || 'Без отдела',
+      date: row.A_created,
+      status: mapAppealStatus(row.A_status),
+      priority: row.A_priority || 'medium',
+      type: row.A_type || 'question',
+      category: row.A_category || row.A_type,
+      description: row.A_content,
+      response: row.A_response,
+      isAnonymous: Boolean(row.A_is_anonymous),
+      isConfidential: Boolean(row.A_is_confidential),
+      messages,
+      lastMessageAt: messages[messages.length - 1]?.createdAt || row.A_created
+    };
+  });
+
+  const scopedAppeals = canViewPeopleInsights
+    ? appeals
+    : appeals.filter((appeal) => Number(appeal.authorId) === Number(userId));
+
+  const appealRecipients = appealRecipientRows[0].map((row) => ({
+    id: row.User_ID,
+    name: row.full_name,
+    role: row.role_name,
+    department: row.department_name
+  }));
+
+  return {
+    appeals: scopedAppeals,
+    appealRecipients
+  };
+};
+
+const fetchForumPayload = async (executor) => {
+  const [forumRows] = await executor.query(
+    `SELECT
+      vfa.Forum_them_ID, ft.Author_ID, vfa.FT_name, vfa.author_name, vfa.department, vfa.FT_views_count, vfa.FT_posts_count,
+      vfa.FT_created, vfa.FT_is_locked, ft.FT_category
+    FROM v_forum_activity vfa
+    JOIN forum_them ft ON ft.Forum_them_ID = vfa.Forum_them_ID
+    ORDER BY vfa.FT_created DESC`
+  );
+
+  const topicIds = forumRows.map((row) => row.Forum_them_ID);
+  const [forumPostRows] = topicIds.length > 0
+    ? await executor.query(
+      `SELECT
+        fp.Forum_posts_ID, fp.Forum_them_ID, fp.Author_ID, fp.FP_content, fp.FP_created, fp.FP_updated, fp.FP_is_edited, fp.FP_is_solution,
+        CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+        r.R_name AS role_name,
+        d.D_name AS department_name
+      FROM forum_posts fp
+      JOIN user u ON u.User_ID = fp.Author_ID
+      LEFT JOIN role r ON r.Role_ID = u.Role_ID
+      LEFT JOIN department d ON d.Department_ID = u.Department_ID
+      WHERE fp.Forum_them_ID IN (?)
+      ORDER BY fp.FP_created ASC, fp.Forum_posts_ID ASC`,
+      [topicIds]
+    )
+    : [[]];
+
+  const forumPostsByTopic = forumPostRows.reduce((accumulator, row) => {
+    const currentRows = accumulator.get(row.Forum_them_ID) || [];
+    currentRows.push({
+      id: row.Forum_posts_ID,
+      topicId: row.Forum_them_ID,
+      authorId: row.Author_ID,
+      authorName: row.author_name,
+      authorRole: normalizeRoleName(row.role_name) || 'employee',
+      department: row.department_name || 'Без отдела',
+      content: row.FP_content,
+      createdAt: row.FP_created,
+      updatedAt: row.FP_updated,
+      isEdited: Boolean(row.FP_is_edited),
+      isSolution: Boolean(row.FP_is_solution)
+    });
+    accumulator.set(row.Forum_them_ID, currentRows);
+    return accumulator;
+  }, new Map());
+
+  return forumRows.map((row) => {
+    const messages = forumPostsByTopic.get(row.Forum_them_ID) || [];
+
+    return {
+      id: row.Forum_them_ID,
+      title: row.FT_name,
+      authorId: row.Author_ID ? Number(row.Author_ID) : null,
+      author: row.author_name,
+      department: row.department,
+      category: row.FT_category || 'Обсуждение',
+      replies: messages.length,
+      views: Number(row.FT_views_count || 0),
+      date: row.FT_created,
+      updatedAt: messages[messages.length - 1]?.createdAt || row.FT_created,
+      isLocked: Boolean(row.FT_is_locked),
+      pinned: Boolean(row.FT_is_locked) || row.FT_category === 'Объявления',
+      tags: row.FT_category ? row.FT_category.toLowerCase().split(/\s+/).slice(0, 3) : [],
+      messages
+    };
+  });
 };
 
 exports.getBootstrap = async (req, res) => {
@@ -1136,6 +1327,42 @@ exports.getBootstrap = async (req, res) => {
   }
 };
 
+exports.getAppealsData = async (req, res) => {
+  try {
+    const data = await fetchAppealsPayload(pool, req.user.userId);
+
+    res.json({
+      success: true,
+      data
+    });
+  } catch (error) {
+    console.error('Get appeals data error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при загрузке обращений'
+    });
+  }
+};
+
+exports.getForumData = async (req, res) => {
+  try {
+    const forumPosts = await fetchForumPayload(pool);
+
+    res.json({
+      success: true,
+      data: {
+        forumPosts
+      }
+    });
+  } catch (error) {
+    console.error('Get forum data error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при загрузке форума'
+    });
+  }
+};
+
 exports.createAppeal = async (req, res) => {
   const type = `${req.body.type || ''}`.trim().toLowerCase();
   const category = `${req.body.category || ''}`.trim();
@@ -1233,6 +1460,12 @@ exports.createAppeal = async (req, res) => {
       link: '/appeals'
     });
 
+    emitAppealCreated({
+      appealId: insertResult.insertId,
+      authorId: req.user.userId,
+      recipientId
+    });
+
     res.status(201).json({
       success: true,
       message: 'Обращение создано',
@@ -1287,6 +1520,68 @@ exports.createForumTopic = async (req, res) => {
     );
 
     await connection.commit();
+
+    const [topicRows] = await pool.query(
+      `SELECT
+        vfa.Forum_them_ID, ft.Author_ID, vfa.FT_name, vfa.author_name, vfa.department, vfa.FT_views_count, vfa.FT_posts_count,
+        vfa.FT_created, vfa.FT_is_locked, ft.FT_category
+      FROM v_forum_activity vfa
+      JOIN forum_them ft ON ft.Forum_them_ID = vfa.Forum_them_ID
+      WHERE vfa.Forum_them_ID = ?
+      LIMIT 1`,
+      [topicResult.insertId]
+    );
+
+    const [messageRows] = await pool.query(
+      `SELECT
+        fp.Forum_posts_ID, fp.Forum_them_ID, fp.Author_ID, fp.FP_content, fp.FP_created, fp.FP_updated, fp.FP_is_edited, fp.FP_is_solution,
+        CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+        r.R_name AS role_name,
+        d.D_name AS department_name
+      FROM forum_posts fp
+      JOIN user u ON u.User_ID = fp.Author_ID
+      LEFT JOIN role r ON r.Role_ID = u.Role_ID
+      LEFT JOIN department d ON d.Department_ID = u.Department_ID
+      WHERE fp.Forum_them_ID = ?
+      ORDER BY fp.FP_created ASC, fp.Forum_posts_ID ASC`,
+      [topicResult.insertId]
+    );
+
+    const messages = messageRows.map((row) => ({
+      id: row.Forum_posts_ID,
+      topicId: row.Forum_them_ID,
+      authorId: row.Author_ID,
+      authorName: row.author_name,
+      authorRole: normalizeRoleName(row.role_name) || 'employee',
+      department: row.department_name || 'Без отдела',
+      content: row.FP_content,
+      createdAt: row.FP_created,
+      updatedAt: row.FP_updated,
+      isEdited: Boolean(row.FP_is_edited),
+      isSolution: Boolean(row.FP_is_solution)
+    }));
+
+    const topicRow = topicRows[0];
+    if (topicRow) {
+      emitForumTopicCreated({
+        topic: {
+          id: topicRow.Forum_them_ID,
+          title: topicRow.FT_name,
+          authorId: topicRow.Author_ID ? Number(topicRow.Author_ID) : null,
+          author: topicRow.author_name,
+          department: topicRow.department,
+          category: topicRow.FT_category || 'Обсуждение',
+          replies: messages.length,
+          views: Number(topicRow.FT_views_count || 0),
+          date: topicRow.FT_created,
+          updatedAt: messages[messages.length - 1]?.createdAt || topicRow.FT_created,
+          isLocked: Boolean(topicRow.FT_is_locked),
+          pinned: Boolean(topicRow.FT_is_locked) || topicRow.FT_category === 'Объявления',
+          tags: topicRow.FT_category ? topicRow.FT_category.toLowerCase().split(/\s+/).slice(0, 3) : [],
+          messages
+        }
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -1935,7 +2230,7 @@ exports.createForumPost = async (req, res) => {
       });
     }
 
-    await connection.query(
+    const [insertResult] = await connection.query(
       `INSERT INTO forum_posts (Forum_them_ID, Author_ID, FP_content)
        VALUES (?, ?, ?)`,
       [topicId, req.user.userId, content]
@@ -1950,6 +2245,43 @@ exports.createForumPost = async (req, res) => {
     );
 
     await connection.commit();
+
+    const [messageRows] = await pool.query(
+      `SELECT
+        fp.Forum_posts_ID, fp.Forum_them_ID, fp.Author_ID, fp.FP_content, fp.FP_created, fp.FP_updated, fp.FP_is_edited, fp.FP_is_solution,
+        CONCAT(u.U_name, ' ', u.U_surname) AS author_name,
+        r.R_name AS role_name,
+        d.D_name AS department_name
+      FROM forum_posts fp
+      JOIN user u ON u.User_ID = fp.Author_ID
+      LEFT JOIN role r ON r.Role_ID = u.Role_ID
+      LEFT JOIN department d ON d.Department_ID = u.Department_ID
+      WHERE fp.Forum_posts_ID = ?
+      LIMIT 1`,
+      [insertResult.insertId]
+    );
+
+    const messageRow = messageRows[0];
+    if (messageRow) {
+      emitForumMessage({
+        topicId,
+        replies: null,
+        updatedAt: messageRow.FP_created,
+        message: {
+          id: messageRow.Forum_posts_ID,
+          topicId: messageRow.Forum_them_ID,
+          authorId: messageRow.Author_ID,
+          authorName: messageRow.author_name,
+          authorRole: normalizeRoleName(messageRow.role_name) || 'employee',
+          department: messageRow.department_name || 'Без отдела',
+          content: messageRow.FP_content,
+          createdAt: messageRow.FP_created,
+          updatedAt: messageRow.FP_updated,
+          isEdited: Boolean(messageRow.FP_is_edited),
+          isSolution: Boolean(messageRow.FP_is_solution)
+        }
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -2064,6 +2396,23 @@ exports.updateAppeal = async (req, res) => {
     });
 
     await connection.commit();
+
+    emitAppealUpdated({
+      appealId,
+      status: mapAppealStatus(normalizedStatus),
+      authorId: appeal.User_ID,
+      recipientId: appeal.A_responder_id
+    });
+
+    if (insertedMessage) {
+      emitAppealMessage({
+        appealId,
+        status: mapAppealStatus(normalizedStatus),
+        message: insertedMessage,
+        authorId: appeal.User_ID,
+        recipientId: appeal.A_responder_id
+      });
+    }
 
     res.json({
       success: true,
@@ -2187,6 +2536,14 @@ exports.sendAppealMessage = async (req, res) => {
     const message = await fetchInsertedMessage(connection, insertResult.insertId);
 
     await connection.commit();
+
+    emitAppealMessage({
+      appealId,
+      status: mapAppealStatus(nextStatus),
+      message,
+      authorId: appeal.User_ID,
+      recipientId: appeal.A_responder_id
+    });
 
     res.status(201).json({
       success: true,

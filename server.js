@@ -1,4 +1,5 @@
 const express = require('express');
+const http = require('http');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -7,9 +8,11 @@ require('dotenv').config();
 const { testConnection } = require('./config/database');
 const authRoutes = require('./routes/authRoute');
 const workspaceRoutes = require('./routes/workspaceRoute');
+const { setupSocketServer } = require('./socketServer');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const server = http.createServer(app);
 
 app.use(helmet());
 
@@ -52,6 +55,8 @@ app.get('/api/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/workspace', workspaceRoutes);
 
+setupSocketServer(server);
+
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -86,7 +91,7 @@ const startServer = async () => {
       process.exit(1);
     }
 
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`🚀 Сервер запущен на порту ${PORT}`);
       console.log(`📦 Режим: ${process.env.NODE_ENV || 'development'}`);
     });

@@ -6,6 +6,8 @@ const router = express.Router();
 
 router.get('/data', authenticate, workspaceController.getBootstrap);
 router.get('/bootstrap', authenticate, workspaceController.getBootstrap);
+router.get('/appeals', authenticate, workspaceController.getAppealsData);
+router.get('/forum', authenticate, workspaceController.getForumData);
 router.put('/notifications/read-all', authenticate, workspaceController.markNotificationsRead);
 router.post('/departments', authenticate, workspaceController.createDepartment);
 router.post('/employees', authenticate, workspaceController.createEmployee);
