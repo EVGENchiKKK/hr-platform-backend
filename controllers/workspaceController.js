@@ -6,10 +6,16 @@ const {
   emitAppealMessage,
   emitForumTopicCreated,
   emitForumMessage,
+  emitNotification,
 } = require('../socketServer');
 
 const DEPARTMENT_COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#14b8a6', '#f97316', '#8b5cf6', '#0ea5e9'];
 const MANAGER_ROLES = ['hr', 'admin'];
+const TASK_STATUS_LABELS = {
+  pending: 'Ожидает',
+  in_progress: 'В работе',
+  completed: 'Завершена',
+};
 
 let ensureAppealMessagesTablePromise;
 let ensureNotificationsTablePromise;
@@ -270,14 +276,40 @@ const ensureNotificationsTable = async () => {
 
 const createNotification = async (executor, { userId, type, title, message, link = null }) => {
   if (!userId || !title || !message) {
-    return;
+    return null;
   }
 
-  await executor.query(
+  const [result] = await executor.query(
     `INSERT INTO notification (User_ID, N_type, N_title, N_message, N_link)
      VALUES (?, ?, ?, ?, ?)`,
     [userId, type || 'system', title, message, link]
   );
+
+  return {
+    id: result.insertId,
+    type: type || 'system',
+    title,
+    text: message,
+    link,
+    unread: true,
+    createdAt: new Date().toISOString(),
+    time: 'Только что',
+  };
+};
+
+const mapWorkspaceTaskStatusToDb = (status) => {
+  switch (`${status || ''}`.trim().toLowerCase()) {
+    case 'pending':
+      return 'todo';
+    case 'in_progress':
+      return 'review';
+    case 'completed':
+      return 'done';
+    case 'cancelled':
+      return 'cancelled';
+    default:
+      return null;
+  }
 };
 
 const formatNotificationTime = (value) => {
@@ -1651,6 +1683,7 @@ exports.createTask = async (req, res) => {
   }
 
   try {
+    await ensureNotificationsTable();
     const [creatorRows, assigneeRows] = await Promise.all([
       pool.query(
         `SELECT u.User_ID, r.R_name
@@ -1710,6 +1743,19 @@ exports.createTask = async (req, res) => {
       ]
     );
 
+    const notification = await createNotification(pool, {
+      userId: assigneeId,
+      type: 'task_assigned',
+      title: 'Новая задача',
+      message: `Вам назначена задача "${title}"`,
+      link: '/tasks'
+    });
+
+    emitNotification({
+      userId: assigneeId,
+      notification,
+    });
+
     res.status(201).json({
       success: true,
       message: 'Задача создана',
@@ -1722,6 +1768,117 @@ exports.createTask = async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Ошибка сервера при создании задачи'
+    });
+  }
+};
+
+exports.updateTaskStatus = async (req, res) => {
+  const taskId = Number(req.params.id);
+  const requestedStatus = `${req.body.status || ''}`.trim().toLowerCase();
+  const nextDbStatus = mapWorkspaceTaskStatusToDb(requestedStatus);
+
+  if (!taskId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор задачи'
+    });
+  }
+
+  if (!nextDbStatus || !['pending', 'in_progress', 'completed'].includes(requestedStatus)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный статус задачи'
+    });
+  }
+
+  try {
+    await ensureNotificationsTable();
+    const [taskRows] = await pool.query(
+      `SELECT Task_ID, T_assignee_user_id, T_status, T_creator_id, T_title
+       FROM task
+       WHERE Task_ID = ?
+       LIMIT 1`,
+      [taskId]
+    );
+
+    const task = taskRows[0];
+
+    if (!task) {
+      return res.status(404).json({
+        success: false,
+        error: 'Задача не найдена'
+      });
+    }
+
+    if (Number(task.T_assignee_user_id) !== Number(req.user.userId)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Вы можете менять статус только своих задач'
+      });
+    }
+
+    if (task.T_status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        error: 'Статус отменённой задачи нельзя изменить'
+      });
+    }
+
+    if (task.T_status === nextDbStatus) {
+      return res.json({
+        success: true,
+        message: 'Статус задачи уже актуален',
+        data: {
+          status: mapTaskStatus(task.T_status)
+        }
+      });
+    }
+
+    await pool.query(
+      `UPDATE task
+       SET T_status = ?,
+           T_completed_at = CASE WHEN ? = 'done' THEN COALESCE(T_completed_at, NOW()) ELSE NULL END,
+           T_updated = NOW()
+       WHERE Task_ID = ?`,
+      [nextDbStatus, nextDbStatus, taskId]
+    );
+
+    if (task.T_creator_id) {
+      const notificationPayload = nextDbStatus === 'done'
+        ? {
+            userId: task.T_creator_id,
+            type: 'task_completed',
+            title: 'Задача выполнена',
+            message: `Сотрудник завершил задачу "${task.T_title}"`,
+            link: '/tasks'
+          }
+        : {
+            userId: task.T_creator_id,
+            type: 'task_status_updated',
+            title: 'Статус задачи изменён',
+            message: `По задаче "${task.T_title}" установлен статус "${TASK_STATUS_LABELS[requestedStatus] || requestedStatus}"`,
+            link: '/tasks'
+          };
+
+      const creatorNotification = await createNotification(pool, notificationPayload);
+      emitNotification({
+        userId: task.T_creator_id,
+        notification: creatorNotification,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: nextDbStatus === 'done' ? 'Задача отмечена как завершённая' : 'Статус задачи обновлён',
+      data: {
+        status: mapTaskStatus(nextDbStatus)
+      }
+    });
+  } catch (error) {
+    console.error('Update task status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при обновлении статуса задачи'
     });
   }
 };
@@ -2090,94 +2247,8 @@ exports.createTest = async (req, res) => {
 };
 
 exports.completeTask = async (req, res) => {
-  const taskId = Number(req.params.id);
-
-  if (!taskId) {
-    return res.status(400).json({
-      success: false,
-      error: 'Некорректный идентификатор задачи'
-    });
-  }
-
-  try {
-    await ensureNotificationsTable();
-    const [taskRows] = await pool.query(
-      `SELECT Task_ID, T_assignee_user_id, T_status
-       FROM task
-       WHERE Task_ID = ?
-       LIMIT 1`,
-      [taskId]
-    );
-
-    const task = taskRows[0];
-
-    if (!task) {
-      return res.status(404).json({
-        success: false,
-        error: 'Задача не найдена'
-      });
-    }
-
-    if (Number(task.T_assignee_user_id) !== Number(req.user.userId)) {
-      return res.status(403).json({
-        success: false,
-        error: 'Вы можете завершать только свои задачи'
-      });
-    }
-
-    if (task.T_status === 'done') {
-      return res.json({
-        success: true,
-        message: 'Задача уже была завершена'
-      });
-    }
-
-    if (task.T_status === 'cancelled') {
-      return res.status(400).json({
-        success: false,
-        error: 'Отменённую задачу нельзя завершить'
-      });
-    }
-
-    await pool.query(
-      `UPDATE task
-       SET T_status = 'done',
-           T_completed_at = NOW(),
-           T_updated = NOW()
-       WHERE Task_ID = ?`,
-      [taskId]
-    );
-
-    const [creatorRows] = await pool.query(
-      `SELECT T_creator_id, T_title
-       FROM task
-       WHERE Task_ID = ?
-       LIMIT 1`,
-      [taskId]
-    );
-
-    const creator = creatorRows[0];
-    if (creator?.T_creator_id) {
-      await createNotification(pool, {
-        userId: creator.T_creator_id,
-        type: 'task_completed',
-        title: 'Задача выполнена',
-        message: `Сотрудник завершил задачу "${creator.T_title}"`,
-        link: '/tasks'
-      });
-    }
-
-    res.json({
-      success: true,
-      message: 'Задача отмечена как завершённая'
-    });
-  } catch (error) {
-    console.error('Complete task error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Ошибка сервера при завершении задачи'
-    });
-  }
+  req.body = { ...req.body, status: 'completed' };
+  return exports.updateTaskStatus(req, res);
 };
 
 exports.createForumPost = async (req, res) => {
@@ -2777,14 +2848,6 @@ exports.startCourse = async (req, res) => {
       ) VALUES (?, ?, 0, 0, 0, ?, NULL, 0, 0, NOW(), NOW(), NULL)`,
       [req.user.userId, courseId, totalModules]
     );
-
-    await createNotification(pool, {
-      userId: assigneeId,
-      type: 'task_assigned',
-      title: 'Новая задача',
-      message: `Вам назначена задача "${title}"`,
-      link: '/tasks'
-    });
 
     res.status(201).json({
       success: true,

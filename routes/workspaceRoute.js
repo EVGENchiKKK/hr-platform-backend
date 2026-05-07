@@ -13,6 +13,7 @@ router.post('/departments', authenticate, workspaceController.createDepartment);
 router.post('/employees', authenticate, workspaceController.createEmployee);
 router.post('/tests', authenticate, workspaceController.createTest);
 router.post('/tasks', authenticate, workspaceController.createTask);
+router.put('/tasks/:id/status', authenticate, workspaceController.updateTaskStatus);
 router.put('/tasks/:id/complete', authenticate, workspaceController.completeTask);
 router.post('/forum/topics', authenticate, workspaceController.createForumTopic);
 router.post('/forum/topics/:id/posts', authenticate, workspaceController.createForumPost);

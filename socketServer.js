@@ -194,6 +194,14 @@ const emitForumMessage = ({ topicId, message, replies, updatedAt }) => {
   io.to(forumTopicRoom(topicId)).emit('forum:message', payload);
 };
 
+const emitNotification = ({ userId, notification }) => {
+  if (!io || !userId || !notification) {
+    return;
+  }
+
+  io.to(userRoom(userId)).emit('notification:new', { notification });
+};
+
 module.exports = {
   setupSocketServer,
   emitAppealCreated,
@@ -201,4 +209,5 @@ module.exports = {
   emitAppealMessage,
   emitForumTopicCreated,
   emitForumMessage,
+  emitNotification,
 };
