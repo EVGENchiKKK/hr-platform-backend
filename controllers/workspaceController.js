@@ -42,6 +42,8 @@ const safeJsonParse = (value, fallback) => {
 const normalizeRoleName = (roleName) => `${roleName || ''}`.trim().toLowerCase();
 
 const isAppealManager = (roleName) => MANAGER_ROLES.includes(normalizeRoleName(roleName));
+const isDepartmentManager = (roleName) => normalizeRoleName(roleName) === 'manager';
+const canViewTeamPeopleInsights = (roleName) => isAppealManager(roleName) || isDepartmentManager(roleName);
 
 const formatPersonName = (name, surname, middleName) =>
   `${surname || ''} ${name || ''}${middleName ? ` ${middleName}` : ''}`.trim();
@@ -626,6 +628,8 @@ exports.getBootstrap = async (req, res) => {
     const currentDepartmentId = Number(currentUserRows[0]?.Department_ID || 0) || null;
     const currentDepartmentName = currentUserRows[0]?.department_name || null;
     const canViewPeopleInsights = isAppealManager(currentRoleName);
+    const canViewTeamInsights = canViewTeamPeopleInsights(currentRoleName);
+    const isManager = isDepartmentManager(currentRoleName);
 
     const [employeeRows, departmentRows, taskRows, appealRows, forumRows, courseRows, surveyRows, appealRecipientRows] = await Promise.all([
       pool.query(
@@ -858,7 +862,7 @@ exports.getBootstrap = async (req, res) => {
       )
       : [[]];
 
-    const [allEnrollmentRows] = canViewPeopleInsights && courseIds.length > 0
+    const [allEnrollmentRows] = canViewTeamInsights && courseIds.length > 0
       ? await pool.query(
         `SELECT
           e.User_ID,
@@ -882,12 +886,13 @@ exports.getBootstrap = async (req, res) => {
         LEFT JOIN department d ON d.Department_ID = u.Department_ID
         LEFT JOIN role r ON r.Role_ID = u.Role_ID
         WHERE e.Course_ID IN (?)
+          AND (? = 1 OR u.Department_ID = ?)
         ORDER BY employee_name ASC`,
-        [courseIds]
+        [courseIds, canViewPeopleInsights ? 1 : 0, currentDepartmentId]
       )
       : [[]];
 
-    const [allSurveyResultRows] = canViewPeopleInsights && surveyIds.length > 0
+    const [allSurveyResultRows] = canViewTeamInsights && surveyIds.length > 0
       ? await pool.query(
         `SELECT
           sr.User_ID,
@@ -906,8 +911,9 @@ exports.getBootstrap = async (req, res) => {
         LEFT JOIN department d ON d.Department_ID = u.Department_ID
         LEFT JOIN role r ON r.Role_ID = u.Role_ID
         WHERE sr.Opros_ID IN (?)
+          AND (? = 1 OR u.Department_ID = ?)
         ORDER BY employee_name ASC`,
-        [surveyIds]
+        [surveyIds, canViewPeopleInsights ? 1 : 0, currentDepartmentId]
       )
       : [[]];
 
@@ -1193,7 +1199,7 @@ exports.getBootstrap = async (req, res) => {
         contentUrl: row.C_content_url,
         contentStructure: content,
         myEnrollment: mapEnrollment(enrollmentRow, totalLessons),
-        participants: canViewPeopleInsights ? (enrollmentsByCourseAll.get(row.Course_ID) || []) : []
+        participants: canViewTeamInsights ? (enrollmentsByCourseAll.get(row.Course_ID) || []) : []
       };
     });
 
@@ -1217,13 +1223,15 @@ exports.getBootstrap = async (req, res) => {
           || Number(row.O_department_id) === Number(currentDepartmentId),
         questions: safeJsonParse(row.O_questions, []),
         myResult: mapSurveyResult(resultRow),
-        submissions: canViewPeopleInsights ? (resultsBySurveyAll.get(row.Opros_ID) || []) : []
+        submissions: canViewTeamInsights ? (resultsBySurveyAll.get(row.Opros_ID) || []) : []
       };
     });
 
     const scopedEmployees = canViewPeopleInsights
       ? employees
-      : employees.filter((employee) => Number(employee.id) === Number(req.user.userId));
+      : isManager && currentDepartmentId
+        ? employees.filter((employee) => Number(employee.departmentId) === Number(currentDepartmentId))
+        : employees.filter((employee) => Number(employee.id) === Number(req.user.userId));
 
     const scopedDepartments = canViewPeopleInsights
       ? departments
@@ -1341,6 +1349,7 @@ exports.getBootstrap = async (req, res) => {
     res.json({
       success: true,
       data: {
+        currentUserId: Number(req.user.userId),
         currentUserRole: currentRoleName,
         currentUserDepartmentId: currentDepartmentId,
         currentUserDepartmentName: currentDepartmentName,
@@ -2128,6 +2137,184 @@ exports.createEmployee = async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Ошибка сервера при создании сотрудника'
+    });
+  }
+};
+
+exports.deleteEmployee = async (req, res) => {
+  const employeeId = Number(req.params.id);
+
+  if (!employeeId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор сотрудника'
+    });
+  }
+
+  if (Number(req.user.userId) === employeeId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Нельзя удалить собственную учётную запись'
+    });
+  }
+
+  try {
+    const [[actorRows], [targetRows]] = await Promise.all([
+      pool.query(
+        `SELECT u.User_ID, u.Department_ID, r.R_name
+         FROM user u
+         JOIN role r ON r.Role_ID = u.Role_ID
+         WHERE u.User_ID = ?
+         LIMIT 1`,
+        [req.user.userId]
+      ),
+      pool.query(
+        `SELECT u.User_ID, u.Department_ID, u.U_is_active, r.R_name
+         FROM user u
+         JOIN role r ON r.Role_ID = u.Role_ID
+         WHERE u.User_ID = ?
+         LIMIT 1`,
+        [employeeId]
+      )
+    ]);
+
+    const actor = actorRows[0];
+    const target = targetRows[0];
+    const actorRole = normalizeRoleName(actor?.R_name);
+    const targetRole = normalizeRoleName(target?.R_name);
+
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        error: 'Недостаточно прав для удаления сотрудника'
+      });
+    }
+
+    if (!target || !target.U_is_active) {
+      return res.status(404).json({
+        success: false,
+        error: 'Сотрудник не найден'
+      });
+    }
+
+    const canDeleteAnyEmployee = isAppealManager(actorRole);
+    const canDeleteDepartmentEmployee = isDepartmentManager(actorRole)
+      && Number(actor.Department_ID) > 0
+      && Number(actor.Department_ID) === Number(target.Department_ID)
+      && !['admin', 'hr', 'manager'].includes(targetRole);
+
+    if (!canDeleteAnyEmployee && !canDeleteDepartmentEmployee) {
+      return res.status(403).json({
+        success: false,
+        error: 'Недостаточно прав для удаления этого сотрудника'
+      });
+    }
+
+    await pool.query(
+      `UPDATE user
+       SET U_is_active = FALSE
+       WHERE User_ID = ?`,
+      [employeeId]
+    );
+
+    await pool.query(
+      `UPDATE department
+       SET D_head_id = NULL
+       WHERE D_head_id = ?`,
+      [employeeId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Сотрудник удалён'
+    });
+  } catch (error) {
+    console.error('Delete employee error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при удалении сотрудника'
+    });
+  }
+};
+
+exports.deleteDepartment = async (req, res) => {
+  const departmentId = Number(req.params.id);
+
+  if (!departmentId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Некорректный идентификатор отдела'
+    });
+  }
+
+  try {
+    const [[actorRows], [departmentRows], [employeeRows]] = await Promise.all([
+      pool.query(
+        `SELECT u.User_ID, r.R_name
+         FROM user u
+         JOIN role r ON r.Role_ID = u.Role_ID
+         WHERE u.User_ID = ?
+         LIMIT 1`,
+        [req.user.userId]
+      ),
+      pool.query(
+        `SELECT Department_ID, D_name, D_is_active
+         FROM department
+         WHERE Department_ID = ?
+         LIMIT 1`,
+        [departmentId]
+      ),
+      pool.query(
+        `SELECT COUNT(*) AS active_employee_count
+         FROM user
+         WHERE Department_ID = ?
+           AND U_is_active = TRUE`,
+        [departmentId]
+      )
+    ]);
+
+    const actor = actorRows[0];
+    const department = departmentRows[0];
+    const activeEmployeeCount = Number(employeeRows[0]?.active_employee_count || 0);
+
+    if (!actor || !isAppealManager(actor.R_name)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Удалять отделы могут только HR и администратор'
+      });
+    }
+
+    if (!department || !department.D_is_active) {
+      return res.status(404).json({
+        success: false,
+        error: 'Отдел не найден'
+      });
+    }
+
+    if (activeEmployeeCount > 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Нельзя удалить отдел, пока в нём есть активные сотрудники'
+      });
+    }
+
+    await pool.query(
+      `UPDATE department
+       SET D_is_active = FALSE,
+           D_head_id = NULL
+       WHERE Department_ID = ?`,
+      [departmentId]
+    );
+
+    res.json({
+      success: true,
+      message: 'Отдел удалён'
+    });
+  } catch (error) {
+    console.error('Delete department error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Ошибка сервера при удалении отдела'
     });
   }
 };
