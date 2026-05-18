@@ -74,6 +74,12 @@ const mapAppealStatus = (status) => {
   }
 };
 
+const APPEAL_TYPE_LABELS = {
+  complaint: 'Жалоба',
+  suggestion: 'Предложение',
+  question: 'Вопрос'
+};
+
 const mapWorkspaceStatusToDb = (status) => {
   const statusMap = {
     open: 'new',
@@ -86,9 +92,10 @@ const mapWorkspaceStatusToDb = (status) => {
 };
 
 const buildAppealSubject = (appeal) => {
+  const localizedType = APPEAL_TYPE_LABELS[`${appeal.A_type || ''}`.trim().toLowerCase()] || appeal.A_type || '';
   const category = appeal.A_category ? `: ${appeal.A_category}` : '';
   const preview = appeal.A_content.length > 48 ? `${appeal.A_content.slice(0, 48)}...` : appeal.A_content;
-  return `${appeal.A_type}${category}` || preview;
+  return `${localizedType}${category}` || preview;
 };
 
 const getLastMonths = (count = 6) => {
